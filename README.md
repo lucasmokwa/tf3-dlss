@@ -18,9 +18,10 @@ newer); FSR 3.1 works on any GPU, and the mod picks the right one for you.
    67% (Quality) or 50% (Performance) for more frames, or 100% for native-resolution anti-aliasing
    (DLAA).
 
-In game, **Ctrl+Shift+D** turns the upscaler on and off (to compare with the game's own) and
-**Ctrl+Shift+U** switches between DLSS and FSR. Settings are in `tf3_dlss.cfg` in the mod folder;
-every line is explained there.
+Settings are in `tf3_dlss.cfg` in the mod folder; every line is explained there, and changes apply
+as soon as the file is saved, also while playing. To compare with the game's own upscaling in game,
+set `debug_keys=1`: then **Ctrl+Shift+D** turns the upscaler on and off and **Ctrl+Shift+U**
+switches between DLSS and FSR.
 
 **Update:** close the game and copy the new zip's contents over the old ones.
 **Uninstall:** delete `version.dll` and the `TF3-DLSS` folder from the game folder.
@@ -113,15 +114,13 @@ same build, with the zip under the run's artifacts instead of a release.
 
 ## Hotkeys
 
+All hotkeys need `debug_keys=1` in the cfg (off by default, so no key press changes the upscaler
+for players):
+
 | Keys | Does |
 |---|---|
 | Ctrl+Shift+D | upscaler on / off |
 | Ctrl+Shift+U | switch DLSS <-> FSR 3.1 |
-
-With `debug_keys=1` in the cfg:
-
-| Keys | Does |
-|---|---|
 | Ctrl+Shift+M | motion vectors: camera + objects -> camera only -> off |
 | Ctrl+Shift+J | jitter on / off |
 | Ctrl+Shift+V | debug view: off -> motion vectors -> jitter |

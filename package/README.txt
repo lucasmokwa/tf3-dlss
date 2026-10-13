@@ -37,11 +37,13 @@ Close the game and copy the new zip's contents over the old ones.
 
 USING IT
 --------
-Ctrl+Shift+D   upscaler on / off (off = the game's own FSR 1, to compare)
-Ctrl+Shift+U   switch between DLSS and FSR 3.1 (NVIDIA RTX cards)
-
 Settings are in tf3_dlss.cfg (open it with Notepad). Every line is explained
 there. Most changes apply while the game runs, as soon as you save the file.
+
+To compare with the game's own upscaling, set debug_keys=1 in tf3_dlss.cfg.
+Then, in game:
+  Ctrl+Shift+D   upscaler on / off (off = the game's own FSR 1)
+  Ctrl+Shift+U   switch between DLSS and FSR 3.1 (NVIDIA RTX cards)
 
 
 CHOOSING AN UPSCALER

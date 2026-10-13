@@ -3391,7 +3391,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_CreateDevice(VkPhysicalDevice physical
             if (!wantFsr) g_fsr.why = "not set up: the game was started with upscaler=dlss or off";
             else if (!g_fsr.deviceReady) g_fsr.why = "the device features FSR needs couldn't be enabled";
             Backend b = ChooseBackend();
-            Log("[upscale] upscaler setting '%s' -> %s; upscaling is %s (Ctrl+Shift+D toggles)", PrefName(pref),
+            Log("[upscale] upscaler setting '%s' -> %s; upscaling is %s (Ctrl+Shift+D toggles with debug_keys=1)", PrefName(pref),
                 BackendName(b), g_dlss.enabled ? "ON" : "OFF");
             if (b == Backend::None) WriteStatus(NoUpscalerReason());
         }
@@ -4714,10 +4714,10 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_QueuePresentKHR(VkQueue queue, const V
     {
         std::lock_guard<std::recursive_mutex> lk(g_t);
 #ifdef _WIN32
-        // Hotkeys, only while the game window has focus:
+        // Hotkeys, only while the game window has focus and only with debug_keys=1 in tf3_dlss.cfg (players
+        // choose with the cfg, so a stray key press can't switch the upscaler off):
         //   Ctrl+Shift+D  upscaler on/off (compare with the game's own FSR 1)
         //   Ctrl+Shift+U  switch between DLSS and FSR 3.1 (when both work)
-        // Developer keys, with debug_keys=1 in tf3_dlss.cfg:
         //   Ctrl+Shift+M  motion vectors: camera + objects -> camera only -> off (until the cfg file changes)
         //   Ctrl+Shift+V  cycle debug views: off -> motion vectors -> jitter
         //   Ctrl+Shift+T  automated camera test with a per-frame trace; press again to cancel
@@ -4738,8 +4738,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_QueuePresentKHR(VkQueue queue, const V
         auto devPressed = [&](int vk, bool& wasDown) { return pressed(vk, wasDown) && dev; };
         static bool dWasDown = false, mWasDown = false, vWasDown = false, tWasDown = false, jWasDown = false,
                     uWasDown = false;
-        if (pressed('U', uWasDown)) {
-            Backend now = g_dlss.backend;
+        if (devPressed('U', uWasDown)) {
+            // the last choice, not the running backend: that one doesn't change while the upscaler is off
+            Backend now = g_dlss.override_ >= 0 ? (Backend)g_dlss.override_ : g_dlss.backend;
             Backend want = now == Backend::Fsr ? Backend::Dlss : Backend::Fsr;
             bool possible = want == Backend::Dlss ? (g_dlss.ngxReady && !g_dlss.failed) : (!g_fsr.failed && FsrLoad());
             if (possible) {
@@ -4775,7 +4776,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_QueuePresentKHR(VkQueue queue, const V
             }
         }
         AutoTestStep(focused, (GetAsyncKeyState(VK_CONTROL) & 0x8000) || (GetAsyncKeyState(VK_SHIFT) & 0x8000));
-        if (pressed('D', dWasDown)) {
+        if (devPressed('D', dWasDown)) {
             g_dlss.enabled = !g_dlss.enabled;
             g_dlss.resetNext = true;
             Log("[upscale] Ctrl+Shift+D: upscaler %s (frame %llu)", g_dlss.enabled ? "ON" : "OFF",
@@ -4815,7 +4816,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_QueuePresentKHR(VkQueue queue, const V
                     BackendName(g_dlss.backend));
             } else if (g_frame % 120 == 0) {
                 std::string why;
-                if (!g_dlss.enabled) why = "the upscaler is switched off (enabled=0 in tf3_dlss.cfg, or Ctrl+Shift+D)";
+                if (!g_dlss.enabled) why = "the upscaler is switched off (enabled=0 in tf3_dlss.cfg, or Ctrl+Shift+D with debug_keys=1)";
                 else if (g_dlss.dev && g_dlss.backend == Backend::None && g_firstFsrFrame) why = NoUpscalerReason();
                 else if (!g_firstFsrFrame)
                     why = "the game hasn't run its own FSR 1 upscaling pass yet, which is the pass the mod replaces. "
