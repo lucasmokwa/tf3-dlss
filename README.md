@@ -11,10 +11,9 @@ Unofficial and experimental; not affiliated with Urban Games, NVIDIA or AMD.
 You need Windows 10 or 11 and Transport Fever 3 on Steam. DLSS needs an NVIDIA RTX card (20 series or
 newer); FSR 3.1 works on any GPU, and the mod picks the right one for you.
 
-1. Unzip the `TF3-DLSS` folder somewhere it can stay, for example `C:\Games\TF3-DLSS`. Not inside
-   `Program Files`.
-2. Double-click `install.bat`. It registers the mod for your Windows user: no administrator rights,
-   no game files changed. If Windows asks whether to run it, choose *Run*.
+1. Open the game folder: in Steam, right-click Transport Fever 3 → *Manage* → *Browse local files*.
+2. Copy everything from the zip into that folder, next to `TransportFever3.exe`: `version.dll` and
+   the `TF3-DLSS` folder. No game files are replaced.
 3. Start the game from Steam and pick a **Resolution scale** in its graphics options:
    67% (Quality) or 50% (Performance) for more frames, or 100% for native-resolution anti-aliasing
    (DLAA).
@@ -23,20 +22,19 @@ In game, **Ctrl+Shift+D** turns the upscaler on and off (to compare with the gam
 **Ctrl+Shift+U** switches between DLSS and FSR. Settings are in `tf3_dlss.cfg` in the mod folder;
 every line is explained there.
 
-**Update:** close the game and replace the folder's contents with the new zip's. If the folder moved,
-run `install.bat` again from the new place.
-**Uninstall:** double-click `uninstall.bat`, then delete the folder.
-**Not working?** See `README.txt` in the folder. If the mod couldn't start, it leaves a
-`TF3-DLSS-DID-NOT-START.txt` there that says why. Bug reports: attach `tf3_dlss.log` from the same
+**Update:** close the game and copy the new zip's contents over the old ones.
+**Uninstall:** delete `version.dll` and the `TF3-DLSS` folder from the game folder.
+**Not working?** See `TF3-DLSS\README.txt`. If the mod couldn't start, it leaves a
+`TF3-DLSS-DID-NOT-START.txt` in the `TF3-DLSS` folder that says why. Bug reports: attach `tf3_dlss.log` from the same
 folder, with your GPU and resolution scale.
 
-### Why is there an install script?
+### What is version.dll?
 
-Vulkan games don't load a DLL dropped into the game folder. The Vulkan loader only loads layers
-registered under `HKCU\SOFTWARE\Khronos\Vulkan\ImplicitLayers`, by the absolute path of the layer's
-`.json` file, so something has to write that path once. `install.bat` runs `bin\tf3_dlss_setup.ps1`,
-which writes that one registry value; `uninstall.bat` removes it. The layer is then offered to every
-Vulkan program but switches itself off in everything except `TransportFever3.exe`.
+The mod itself is a Vulkan layer (`TF3-DLSS\bin\VkLayer_tf3_dlss.dll`), and Vulkan only loads layers
+it has been told about. `version.dll` is a small stand-in for the Windows file of the same name:
+the game loads it from its own folder at startup, it tells Vulkan where the layer is for this one
+game process, and passes everything else on to the real `version.dll` in Windows. Nothing is
+written to the registry or outside the game folder, and no other program sees the mod.
 
 ## Known limitations
 
@@ -59,17 +57,18 @@ The rest of this page is for developers.
 | Upscale | After RCAS, records DLSS or FSR 3.1 into the game's command buffer, then swaps the blit's input for the upscaled image |
 | Extras | Texture LOD bias, sharpening (CAS-style for DLSS, RCAS for FSR), hover-highlight depth fix |
 
-The layer is installed as a Vulkan *implicit* layer (one registry value under
-`HKCU\SOFTWARE\Khronos\Vulkan\ImplicitLayers`) and fails the loader negotiation in every process
-except `TransportFever3.exe`, so other Vulkan programs never load it.
+A release enables the layer with `version.dll` in the game folder (`layer/proxy/`): when the game
+loads it, it sets `VK_ADD_LAYER_PATH` to `TF3-DLSS\bin` and adds `VK_LAYER_TF3_dlss` to
+`VK_INSTANCE_LAYERS` / `VK_LOADER_LAYERS_ENABLE` for that process only (the same variables
+`run_tf3.ps1` sets), then forwards every `version.dll` call to `System32\version.dll`.
 
 ## Repository layout
 
 | Folder | Contents |
 |---|---|
-| `layer/` | Layer source (`src/layer.cpp`), shaders (`shaders/`), CMake project, layer manifests |
+| `layer/` | Layer source (`src/layer.cpp`), shaders (`shaders/`), `version.dll` stand-in (`proxy/`), CMake project, layer manifest |
 | `scripts/` | `build.ps1`, `run_tf3.ps1` (dev launch), `run_validation.ps1`, `get_fsr.ps1`, `package.ps1` |
-| `package/` | Files shipped as-is in a release: `README.txt`, `install.bat`, `uninstall.bat`, `licenses/`, setup script |
+| `package/` | Files shipped as-is in a release: `README.txt`, `licenses/` |
 | `third_party/ffx-api/` | AMD FidelityFX API headers (MIT); the runtime DLL is downloaded into `bin/`, not committed |
 | `tools/` | RenderDoc analysis scripts used during development |
 | `tf3_dlss.cfg` | Settings, documented line by line (the release copy) |
@@ -85,13 +84,13 @@ Needs Windows with:
 ```powershell
 cd scripts
 .\get_fsr.ps1        # once: AMD's signed amd_fidelityfx_vk.dll (FidelityFX SDK v1.1.4)
-.\build.ps1          # -> build\bin: VkLayer_tf3_dlss.dll, manifests, nvngx_dlss.dll, amd_fidelityfx_vk.dll
+.\build.ps1          # -> build\bin: VkLayer_tf3_dlss.dll, manifest, nvngx_dlss.dll, amd_fidelityfx_vk.dll
+                     #    build\proxy: version.dll
 .\run_tf3.ps1        # starts TF3 with the layer from build\bin (log: logs\layer.log)
 ```
 
-`run_tf3.ps1` enables the layer for that launch only and uses the repo's `tf3_dlss.cfg`. If the
-release version is also installed with `install.bat`, both register the same layer name and the
-Vulkan loader uses one of them, so uninstall the release while developing.
+`run_tf3.ps1` enables the layer for that launch only and uses the repo's `tf3_dlss.cfg`. A release
+installed in the game folder steps aside for it: its `version.dll` sees the layer is already enabled.
 
 `run_validation.ps1` does the same with the Khronos validation layer below ours
 (`-Sync` adds synchronisation validation); messages go to `logs\validation.log`.

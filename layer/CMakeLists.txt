@@ -61,9 +61,8 @@ set_target_properties(VkLayer_tf3_dlss PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
   LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 
-# Layer manifests and the DLSS / FSR runtimes sit next to the layer DLL
+# The layer manifest and the DLSS / FSR runtimes sit next to the layer DLL
 configure_file(VkLayer_tf3_dlss.json "${CMAKE_BINARY_DIR}/bin/VkLayer_tf3_dlss.json" COPYONLY)
-configure_file(VkLayer_tf3_dlss_implicit.json "${CMAKE_BINARY_DIR}/bin/VkLayer_tf3_dlss_implicit.json" COPYONLY)
 if(EXISTS "${FFX_DLL}")
   add_custom_command(TARGET VkLayer_tf3_dlss POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different "${FFX_DLL}" "${CMAKE_BINARY_DIR}/bin/amd_fidelityfx_vk.dll")
@@ -77,3 +76,13 @@ add_custom_command(TARGET VkLayer_tf3_dlss POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/bin/dev"
   COMMAND ${CMAKE_COMMAND} -E copy_if_different
           "${DLSS_SDK}/lib/Windows_x86_64/dev/nvngx_dlss.dll" "${CMAKE_BINARY_DIR}/bin/dev/nvngx_dlss.dll")
+
+# version.dll stand-in that goes next to TransportFever3.exe and enables the layer (drop-in install).
+# Built into build\proxy, not build\bin, so it never sits next to the layer during development.
+add_library(tf3_dlss_proxy SHARED proxy/version_proxy.cpp proxy/version.def)
+target_compile_definitions(tf3_dlss_proxy PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN)
+set_target_properties(tf3_dlss_proxy PROPERTIES
+  OUTPUT_NAME version
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/proxy"
+  LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/proxy"
+  ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/proxy")

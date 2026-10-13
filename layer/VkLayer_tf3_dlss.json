@@ -6,7 +6,7 @@
     "library_path": ".\\VkLayer_tf3_dlss.dll",
     "api_version": "1.4.341",
     "implementation_version": "100",
-    "description": "TF3-DLSS 0.1.0: DLSS / FSR 3.1 for Transport Fever 3 (development manifest, used by run_tf3.ps1)",
+    "description": "TF3-DLSS 0.1.0: DLSS / FSR 3.1 for Transport Fever 3. Enabled by version.dll in the game folder, or by run_tf3.ps1.",
     "functions": {
       "vkNegotiateLoaderLayerInterfaceVersion": "tf3_NegotiateLoaderLayerInterfaceVersion"
     }

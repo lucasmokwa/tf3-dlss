@@ -2,8 +2,8 @@
 # Slow; for testing only. Validation messages go to logs\validation.log.
 #   .\run_validation.ps1          core validation
 #   .\run_validation.ps1 -Sync    also synchronisation validation (much slower; finds missing barriers)
-# Uses the development build (build\bin) like run_tf3.ps1. If the mod is also installed with
-# install.bat, both registrations name the same layer and the loader uses one of them.
+# Uses the development build (build\bin) like run_tf3.ps1. A release installed in the game folder
+# steps aside for it (its version.dll sees the layer is already enabled).
 param([switch]$Sync)
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
