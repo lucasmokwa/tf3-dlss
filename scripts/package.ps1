@@ -22,7 +22,7 @@ if (-not (Test-Path $proxy)) { throw 'build\proxy\version.dll is missing (build.
 
 # The shipped cfg must have the developer options off.
 $cfg = Get-Content (Join-Path $root 'tf3_dlss.cfg') -Raw
-foreach ($pair in 'debug_keys=0', 'debug_view=0', 'dlss_dev=0', 'fsr_debug=0', 'enabled=1', 'upscaler=auto') {
+foreach ($pair in 'debug_keys=0', 'debug_view=0', 'dlss_dev=0', 'fsr_debug=0', 'overlay=0', 'enabled=1', 'upscaler=auto') {
     if ($cfg -notmatch "(?m)^$([regex]::Escape($pair))\s*$") { throw "tf3_dlss.cfg should have $pair for a release" }
 }
 

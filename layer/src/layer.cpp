@@ -264,6 +264,10 @@ struct Config {
     bool mipBiasAuto = true;    // texture LOD bias: NVIDIA's log2(render/display) - 1 (needs a restart)
     float mipBias = 0.f;        // used when mipBiasAuto is false (0 = off)
     float sharpness = 0.f;      // sharpening after DLSS, 0..1 (0 = off)
+    float fsrSharpness = 0.5f;  // FSR's own sharpening (RCAS), 0..1 (0 = off)
+    int overlay = 0;            // 1 = on-screen info box (upscaler, sizes, sharpness, jitter)
+    float overlayX = 25.f;      // its top-left corner, percent of the screen from the left ...
+    float overlayY = 1.f;       // ... and from the top
     float jitterSignX = 1.f;    // flip if a still image looks fuzzy/shaky (NVIDIA guide 8.4)
     float jitterSignY = 1.f;
     int dlssDev = 0;            // 1 = NVIDIA's developer DLSS build (debug overlays, Ctrl+Alt+F12)
@@ -326,6 +330,9 @@ bool LoadConfig() {
         else if (k == "fsr_jitter_sign_x") c.fsrJitterSignX = fv;
         else if (k == "fsr_jitter_sign_y") c.fsrJitterSignY = fv;
         else if (k == "debug_keys") c.debugKeys = iv;
+        else if (k == "overlay") c.overlay = iv;
+        else if (k == "overlay_x") c.overlayX = std::min(std::max(fv, 0.f), 100.f);
+        else if (k == "overlay_y") c.overlayY = std::min(std::max(fv, 0.f), 100.f);
         else if (k == "preset") c.preset = iv;
         else if (k == "motion_vectors") c.motionVectors = iv;
         else if (k == "mv_scale_x") c.mvScaleX = fv;
@@ -340,6 +347,7 @@ bool LoadConfig() {
         else if (k == "object_depth_test") c.objectDepthTest = iv;
         else if (k == "fix_highlight_depth") c.fixHighlightDepth = iv;
         else if (k == "sharpness") c.sharpness = std::min(std::max(fv, 0.f), 1.f);
+        else if (k == "fsr_sharpness") c.fsrSharpness = std::min(std::max(fv, 0.f), 1.f);
         else if (k == "mip_bias") {
             c.mipBiasAuto = v == "auto";
             c.mipBias = c.mipBiasAuto ? 0.f : fv;
@@ -354,12 +362,12 @@ bool LoadConfig() {
     }
     g_cfg = c;
     Log("[cfg] loaded %s: enabled=%d upscaler=%s preset=%d motion_vectors=%d object_motion=%d jitter=%d (phases %d, "
-        "sign %g,%g) sharpness=%g mip_bias=%s%g fsr_color=%s fsr_debug=%d debug_keys=%d dlss_dev=%d mv_scale=(%g,%g) "
-        "reset_distance=%g debug_view=%d cfg_live=%d log_every=%d",
+        "sign %g,%g, fsr sign %g,%g) sharpness=%g fsr_sharpness=%g mip_bias=%s%g fsr_color=%s fsr_debug=%d overlay=%d debug_keys=%d "
+        "dlss_dev=%d mv_scale=(%g,%g) reset_distance=%g debug_view=%d cfg_live=%d log_every=%d",
         g_cfgPath.string().c_str(), c.enabled, PrefName(c.upscaler), c.preset, c.motionVectors, c.objectMotion,
-        c.jitter, c.jitterPhases, c.jitterSignX, c.jitterSignY, c.sharpness, c.mipBiasAuto ? "auto " : "", c.mipBias,
-        c.fsrColorSrgb ? "srgb" : "linear", c.fsrDebug, c.debugKeys, c.dlssDev, c.mvScaleX, c.mvScaleY,
-        c.resetDistance, c.debugView, c.cfgLive, c.logEvery);
+        c.jitter, c.jitterPhases, c.jitterSignX, c.jitterSignY, c.fsrJitterSignX, c.fsrJitterSignY, c.sharpness, c.fsrSharpness,
+        c.mipBiasAuto ? "auto " : "", c.mipBias, c.fsrColorSrgb ? "srgb" : "linear", c.fsrDebug, c.overlay,
+        c.debugKeys, c.dlssDev, c.mvScaleX, c.mvScaleY, c.resetDistance, c.debugView, c.cfgLive, c.logEvery);
     return true;
 }
 
@@ -685,6 +693,7 @@ std::unordered_map<VkFramebuffer, std::vector<VkImageView>> g_fbViews;
 std::unordered_map<VkRenderPass, RenderPassInfo> g_renderPasses;
 std::unordered_map<VkImage, VkImageLayout> g_layout;  // last layout recorded anywhere
 std::unordered_map<VkDescriptorSetLayout, std::vector<LayoutBinding>> g_setLayouts;
+std::unordered_set<VkDescriptorSetLayout> g_updateAfterBindLayouts;  // their sets need an update-after-bind pool
 std::unordered_map<VkDescriptorSet, VkDescriptorSetLayout> g_setLayoutOf;
 std::unordered_map<VkDescriptorSet, std::map<uint32_t, std::vector<DescItem>>> g_setContents;
 std::unordered_map<VkDescriptorUpdateTemplate, std::vector<TemplateEntry>> g_templates;
@@ -956,6 +965,17 @@ struct Dlss {
     VkImage shpImage = VK_NULL_HANDLE;   // temporary result, copied back into outImage
     VkImageView shpView = VK_NULL_HANDLE;
     VkImageView shpBoundOut = VK_NULL_HANDLE;
+    // on-screen info box (overlay.comp)
+    bool ovFailed = false, ovSetUsed = false;
+    VkDescriptorSetLayout ovSetLayout = VK_NULL_HANDLE;
+    VkPipelineLayout ovPipeLayout = VK_NULL_HANDLE;
+    VkPipeline ovPipeline = VK_NULL_HANDLE;
+    VkDescriptorPool ovPool = VK_NULL_HANDLE;
+    VkDescriptorSet ovSet = VK_NULL_HANDLE;
+    VkImageView ovBoundOut = VK_NULL_HANDLE;
+    VkBuffer ovBuffer = VK_NULL_HANDLE;  // font + kOvSlots text slots, host-visible
+    char* ovPtr = nullptr;
+    uint64_t ovCounter = 0;
     // object motion pass
     VkViewport sceneVp{};  // the game's viewport for the scene passes (without our jitter)
     bool sceneVpValid = false;
@@ -1109,6 +1129,21 @@ double NowMs() {
 #else
     return 0.0;
 #endif
+}
+
+// Frames per second for the info box: frames presented in the last half second or so.
+float g_fps = 0.f;
+void CountFrameForFps() {
+    static double start = 0.0;
+    static uint32_t frames = 0;
+    double now = NowMs();
+    if (start == 0.0) start = now;
+    ++frames;
+    if (now - start >= 500.0) {
+        g_fps = (float)(frames * 1000.0 / (now - start));
+        start = now;
+        frames = 0;
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2470,6 +2505,7 @@ struct Fsr {
     PfnFfxDispatch dispatch = nullptr;
     PfnFfxQuery query = nullptr;
     ffxContext ctx = nullptr;
+    VkPhysicalDevice appPhysicalDevice = VK_NULL_HANDLE;  // the loader's handle for our GPU (see AppPhysicalDevice)
     uint32_t inW = 0, inH = 0, outW = 0, outH = 0;
     int debugInUse = -1, srgbInUse = -1;
     double lastMs = 0;
@@ -2514,6 +2550,54 @@ bool FsrLoad() {
     return g_fsr.available;
 }
 
+// The FSR runtime calls instance functions (vkGetPhysicalDeviceProperties, ...) through vulkan-1.dll,
+// i.e. the loader's trampolines, which only accept the application's physical-device handles. The
+// handle a layer sees in vkCreateDevice is the loader's unwrapped one; passing that to FSR makes the
+// loader abort the process. So ask the loader for its handles and pick the one for our GPU (by UUID).
+// Caller holds g_t.
+VkPhysicalDevice AppPhysicalDevice(DeviceData* d) {
+#ifdef _WIN32
+    if (g_fsr.appPhysicalDevice) return g_fsr.appPhysicalDevice;
+    HMODULE vk = GetModuleHandleW(L"vulkan-1.dll");
+    auto enumerate = vk ? (PFN_vkEnumeratePhysicalDevices)(void*)GetProcAddress(vk, "vkEnumeratePhysicalDevices") : nullptr;
+    auto loaderProps2 =
+        vk ? (PFN_vkGetPhysicalDeviceProperties2)(void*)GetProcAddress(vk, "vkGetPhysicalDeviceProperties2") : nullptr;
+    InstanceData* inst = d->instance;
+    auto ourProps2 = inst ? (PFN_vkGetPhysicalDeviceProperties2)inst->GetInstanceProcAddr(
+                                inst->instance, "vkGetPhysicalDeviceProperties2")
+                          : nullptr;
+    if (!enumerate || !loaderProps2 || !ourProps2) {
+        Log("[fsr] can't reach the Vulkan loader's functions (vulkan-1.dll %s)", vk ? "loaded" : "not loaded");
+        return VK_NULL_HANDLE;
+    }
+    auto uuid = [](PFN_vkGetPhysicalDeviceProperties2 fn, VkPhysicalDevice pd, uint8_t out[VK_UUID_SIZE]) {
+        VkPhysicalDeviceIDProperties id{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
+        VkPhysicalDeviceProperties2 p{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+        p.pNext = &id;
+        fn(pd, &p);
+        std::memcpy(out, id.deviceUUID, VK_UUID_SIZE);
+    };
+    uint8_t ours[VK_UUID_SIZE];
+    uuid(ourProps2, d->physicalDevice, ours);
+    uint32_t n = 0;
+    enumerate(inst->instance, &n, nullptr);
+    std::vector<VkPhysicalDevice> pds(n);
+    if (n) enumerate(inst->instance, &n, pds.data());
+    for (uint32_t i = 0; i < n; ++i) {
+        uint8_t theirs[VK_UUID_SIZE];
+        uuid(loaderProps2, pds[i], theirs);
+        if (!std::memcmp(ours, theirs, VK_UUID_SIZE)) {
+            g_fsr.appPhysicalDevice = pds[i];
+            Log("[fsr] GPU handle for the FSR runtime: %s (layer handle %s, %u GPUs)", H(pds[i]).c_str(),
+                H(d->physicalDevice).c_str(), n);
+            return pds[i];
+        }
+    }
+    Log("[fsr] none of the loader's %u GPUs matches ours", n);
+#endif
+    return VK_NULL_HANDLE;
+}
+
 // (Re)create the FSR context for the current sizes. Caller holds g_t.
 bool FsrEnsure(DeviceData* d) {
     int dbg = g_cfg.fsrDebug ? 1 : 0;
@@ -2527,10 +2611,17 @@ bool FsrEnsure(DeviceData* d) {
         g_fsr.destroy(&g_fsr.ctx, nullptr);
         g_fsr.ctx = nullptr;
     }
+    VkPhysicalDevice appPd = AppPhysicalDevice(d);
+    if (!appPd) {
+        g_fsr.why = "FSR 3.1 could not find the GPU through the Vulkan loader";
+        g_fsr.failed = true;
+        Log("[fsr] %s", g_fsr.why.c_str());
+        return false;
+    }
     ffxCreateBackendVKDesc be{};
     be.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK;
     be.vkDevice = d->device;
-    be.vkPhysicalDevice = d->physicalDevice;
+    be.vkPhysicalDevice = appPd;  // the loader's handle: FSR calls instance functions through vulkan-1.dll
     be.vkDeviceProcAddr = d->GetDeviceProcAddr;  // the next layer's: FSR's commands bypass our hooks
     ffxCreateContextDescUpscale cd{};
     cd.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
@@ -2542,6 +2633,7 @@ bool FsrEnsure(DeviceData* d) {
     cd.maxRenderSize = {g_dlss.inW, g_dlss.inH};
     cd.maxUpscaleSize = {g_dlss.outW, g_dlss.outH};
     cd.fpMessage = &FfxMessage;
+    Log("[fsr] creating the context (%ux%u -> %ux%u)", g_dlss.inW, g_dlss.inH, g_dlss.outW, g_dlss.outH);
     ffxReturnCode_t r = g_fsr.create(&g_fsr.ctx, &cd.header, nullptr);
     if (r != FFX_API_RETURN_OK || !g_fsr.ctx) {
         char b[96];
@@ -2597,8 +2689,8 @@ bool RecordFsr(VkCommandBuffer cb, const CmdState& cs, const ImageInfo& ci) {
     dd.motionVectorScale = {g_cfg.mvScaleX, g_cfg.mvScaleY};
     dd.renderSize = {ci.w, ci.h};
     dd.upscaleSize = {g_dlss.outW, g_dlss.outH};
-    dd.enableSharpening = g_cfg.sharpness > 0.f;  // FSR's own RCAS instead of our sharpening pass
-    dd.sharpness = g_cfg.sharpness;
+    dd.enableSharpening = g_cfg.fsrSharpness > 0.f;  // FSR's own RCAS instead of our sharpening pass
+    dd.sharpness = g_cfg.fsrSharpness;
     double now = NowMs();
     dd.frameTimeDelta = g_fsr.lastMs > 0 ? (float)std::min(std::max(now - g_fsr.lastMs, 1.0), 100.0) : 16.7f;
     g_fsr.lastMs = now;
@@ -2627,6 +2719,214 @@ void DestroyFsr(DeviceData* d) {
         g_fsr.ctx = nullptr;
     }
     g_fsr.inW = g_fsr.inH = g_fsr.outW = g_fsr.outH = 0;
+    g_fsr.appPhysicalDevice = VK_NULL_HANDLE;
+}
+
+// ---------------------------------------------------------------------------------------------
+// On-screen info box (overlay=1, or Ctrl+Shift+O with debug_keys=1)
+// ---------------------------------------------------------------------------------------------
+// A few lines of text drawn into the upscaled image by overlay.comp, so settings can be compared
+// while tuning them with the hotkeys. Only shown while an upscaler runs (it draws into our output).
+const uint32_t kOvSpirv[] = {
+#include "overlay.spv.inc"
+};
+constexpr uint32_t kOvLines = 6, kOvCols = 44;
+constexpr uint32_t kOvFontWords = 128;           // 64 glyphs (ASCII 32..95) x 2 words
+constexpr uint32_t kOvSlotWords = 128;           // text of one frame: kOvLines x kOvCols bytes, rounded up
+constexpr uint32_t kOvSlots = 8;                 // frames in flight never reach this
+static_assert(kOvLines * kOvCols <= kOvSlotWords * 4, "overlay text must fit a slot");
+struct OvPush {
+    int32_t origin[2], size[2];
+    int32_t scale, lines, cols, textBase;
+};
+
+// 5x7 font: 7 rows of 5 pixels per character, top row first, separated by '|'. Characters not
+// listed draw blank; lower case is drawn as upper case.
+struct Glyph {
+    char c;
+    const char* rows;
+};
+const Glyph kFont[] = {
+    {'0', ".###.|#...#|#..##|#.#.#|##..#|#...#|.###."}, {'1', "..#..|.##..|..#..|..#..|..#..|..#..|.###."},
+    {'2', ".###.|#...#|....#|...#.|..#..|.#...|#####"}, {'3', "#####|...#.|..#..|...#.|....#|#...#|.###."},
+    {'4', "...#.|..##.|.#.#.|#..#.|#####|...#.|...#."}, {'5', "#####|#....|####.|....#|....#|#...#|.###."},
+    {'6', "..##.|.#...|#....|####.|#...#|#...#|.###."}, {'7', "#####|....#|...#.|..#..|.#...|.#...|.#..."},
+    {'8', ".###.|#...#|#...#|.###.|#...#|#...#|.###."}, {'9', ".###.|#...#|#...#|.####|....#|...#.|.##.."},
+    {'A', ".###.|#...#|#...#|#####|#...#|#...#|#...#"}, {'B', "####.|#...#|#...#|####.|#...#|#...#|####."},
+    {'C', ".###.|#...#|#....|#....|#....|#...#|.###."}, {'D', "###..|#..#.|#...#|#...#|#...#|#..#.|###.."},
+    {'E', "#####|#....|#....|####.|#....|#....|#####"}, {'F', "#####|#....|#....|####.|#....|#....|#...."},
+    {'G', ".###.|#...#|#....|#.###|#...#|#...#|.####"}, {'H', "#...#|#...#|#...#|#####|#...#|#...#|#...#"},
+    {'I', ".###.|..#..|..#..|..#..|..#..|..#..|.###."}, {'J', "..###|...#.|...#.|...#.|...#.|#..#.|.##.."},
+    {'K', "#...#|#..#.|#.#..|##...|#.#..|#..#.|#...#"}, {'L', "#....|#....|#....|#....|#....|#....|#####"},
+    {'M', "#...#|##.##|#.#.#|#.#.#|#...#|#...#|#...#"}, {'N', "#...#|#...#|##..#|#.#.#|#..##|#...#|#...#"},
+    {'O', ".###.|#...#|#...#|#...#|#...#|#...#|.###."}, {'P', "####.|#...#|#...#|####.|#....|#....|#...."},
+    {'Q', ".###.|#...#|#...#|#...#|#.#.#|#..#.|.##.#"}, {'R', "####.|#...#|#...#|####.|#.#..|#..#.|#...#"},
+    {'S', ".####|#....|#....|.###.|....#|....#|####."}, {'T', "#####|..#..|..#..|..#..|..#..|..#..|..#.."},
+    {'U', "#...#|#...#|#...#|#...#|#...#|#...#|.###."}, {'V', "#...#|#...#|#...#|#...#|#...#|.#.#.|..#.."},
+    {'W', "#...#|#...#|#...#|#.#.#|#.#.#|#.#.#|.#.#."}, {'X', "#...#|#...#|.#.#.|..#..|.#.#.|#...#|#...#"},
+    {'Y', "#...#|#...#|.#.#.|..#..|..#..|..#..|..#.."}, {'Z', "#####|....#|...#.|..#..|.#...|#....|#####"},
+    {'.', ".....|.....|.....|.....|.....|.##..|.##.."}, {',', ".....|.....|.....|.....|.##..|..#..|.#..."},
+    {':', ".....|.##..|.##..|.....|.##..|.##..|....."}, {'-', ".....|.....|.....|#####|.....|.....|....."},
+    {'+', ".....|..#..|..#..|#####|..#..|..#..|....."}, {'(', "...#.|..#..|.#...|.#...|.#...|..#..|...#."},
+    {')', ".#...|..#..|...#.|...#.|...#.|..#..|.#..."}, {'[', ".###.|.#...|.#...|.#...|.#...|.#...|.###."},
+    {']', ".###.|...#.|...#.|...#.|...#.|...#.|.###."}, {'/', ".....|....#|...#.|..#..|.#...|#....|....."},
+    {'>', ".#...|..#..|...#.|....#|...#.|..#..|.#..."}, {'%', "##...|##..#|...#.|..#..|.#...|#..##|...##"},
+    {'=', ".....|.....|#####|.....|#####|.....|....."}, {'!', "..#..|..#..|..#..|..#..|..#..|.....|..#.."},
+    {'?', ".###.|#...#|....#|...#.|..#..|.....|..#.."},
+};
+
+// Packs kFont for overlay.comp: glyph g = ASCII 32 + g, rows 0-3 in word 2g, rows 4-6 in word 2g+1,
+// bit row * 5 + (4 - column).
+void PackFont(uint32_t* words) {
+    std::memset(words, 0, kOvFontWords * 4);
+    for (const Glyph& g : kFont) {
+        std::string rows;
+        for (const char* r = g.rows; *r; ++r)
+            if (*r == '#' || *r == '.') rows += *r;  // '|' and other separators are only for reading
+        if (rows.size() != 35) {
+            Log("[overlay] font: glyph '%c' has %zu pixels, not 35; drawn blank", g.c, rows.size());
+            continue;
+        }
+        uint32_t idx = (uint32_t)(g.c - 32);
+        for (int row = 0; row < 7; ++row)
+            for (int col = 0; col < 5; ++col)
+                if (rows[row * 5 + col] == '#')
+                    words[idx * 2 + (row < 4 ? 0 : 1)] |= 1u << ((row < 4 ? row : row - 4) * 5 + (4 - col));
+    }
+}
+
+bool EnsureOverlay(DeviceData* d) {
+    if (g_dlss.ovFailed) return false;
+    if (!g_dlss.ovPipeline) {
+        g_dlss.ovFailed = true;  // cleared on success
+        VkDescriptorSetLayoutBinding b[2] = {};
+        b[0] = {0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+        b[1] = {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+        VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        li.bindingCount = 2;
+        li.pBindings = b;
+        if (d->CreateDescriptorSetLayout(d->device, &li, nullptr, &g_dlss.ovSetLayout) != VK_SUCCESS) return false;
+        VkPushConstantRange pr{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(OvPush)};
+        VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        pli.setLayoutCount = 1;
+        pli.pSetLayouts = &g_dlss.ovSetLayout;
+        pli.pushConstantRangeCount = 1;
+        pli.pPushConstantRanges = &pr;
+        if (d->CreatePipelineLayout(d->device, &pli, nullptr, &g_dlss.ovPipeLayout) != VK_SUCCESS) return false;
+        VkShaderModuleCreateInfo si{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        si.codeSize = sizeof kOvSpirv;
+        si.pCode = kOvSpirv;
+        VkShaderModule mod;
+        if (d->CreateShaderModule(d->device, &si, nullptr, &mod) != VK_SUCCESS) return false;
+        VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        ci.stage.module = mod;
+        ci.stage.pName = "main";
+        ci.layout = g_dlss.ovPipeLayout;
+        VkResult r = d->CreateComputePipelines(d->device, VK_NULL_HANDLE, 1, &ci, nullptr, &g_dlss.ovPipeline);
+        d->DestroyShaderModule(d->device, mod, nullptr);
+        if (r != VK_SUCCESS) return false;
+        VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1}};
+        VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        pi.maxSets = 1;
+        pi.poolSizeCount = 2;
+        pi.pPoolSizes = sizes;
+        if (d->CreateDescriptorPool(d->device, &pi, nullptr, &g_dlss.ovPool) != VK_SUCCESS) return false;
+        VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        ai.descriptorPool = g_dlss.ovPool;
+        ai.descriptorSetCount = 1;
+        ai.pSetLayouts = &g_dlss.ovSetLayout;
+        if (d->AllocateDescriptorSets(d->device, &ai, &g_dlss.ovSet) != VK_SUCCESS) return false;
+        VkDeviceSize size = (kOvFontWords + kOvSlots * kOvSlotWords) * 4;
+        if (!CreateBuffer(d, size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &g_dlss.ovBuffer,
+                          &g_dlss.ovPtr))
+            return false;
+        PackFont(reinterpret_cast<uint32_t*>(g_dlss.ovPtr));
+        VkDescriptorBufferInfo bi{g_dlss.ovBuffer, 0, VK_WHOLE_SIZE};
+        VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, g_dlss.ovSet, 1, 0, 1,
+                               VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &bi, nullptr};
+        d->UpdateDescriptorSets(d->device, 1, &w, 0, nullptr);
+        g_dlss.ovFailed = false;
+        Log("[overlay] info box ready");
+    }
+    if (g_dlss.ovBoundOut != g_dlss.outView) {  // output image recreated (size change)
+        if (g_dlss.ovSetUsed) d->DeviceWaitIdle(d->device);
+        VkDescriptorImageInfo img{VK_NULL_HANDLE, g_dlss.outView, VK_IMAGE_LAYOUT_GENERAL};
+        VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, g_dlss.ovSet, 0, 0, 1,
+                               VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &img, nullptr, nullptr};
+        d->UpdateDescriptorSets(d->device, 1, &w, 0, nullptr);
+        g_dlss.ovBoundOut = g_dlss.outView;
+    }
+    return true;
+}
+
+// The info box's lines for this frame.
+std::vector<std::string> OverlayLines(Backend backend, const CmdState& cs, uint32_t inW, uint32_t inH) {
+    char b[kOvLines][96];
+    bool fsr = backend == Backend::Fsr;
+    if (fsr) std::snprintf(b[0], sizeof b[0], "TF3-DLSS " TF3_DLSS_VERSION "  FSR 3.1");
+    else if (g_cfg.preset > 0)
+        std::snprintf(b[0], sizeof b[0], "TF3-DLSS " TF3_DLSS_VERSION "  DLSS, PRESET %c", 'A' + g_cfg.preset - 1);
+    else std::snprintf(b[0], sizeof b[0], "TF3-DLSS " TF3_DLSS_VERSION "  DLSS, PRESET AUTO");
+    std::snprintf(b[1], sizeof b[1], "%ux%u -> %ux%u (%d%%)", inW, inH, g_dlss.outW, g_dlss.outH,
+                  g_dlss.outW ? (int)std::lround(100.0 * inW / g_dlss.outW) : 0);
+    std::snprintf(b[2], sizeof b[2], "SHARPNESS %.1f         [CTRL+SHIFT+UP/DOWN]",
+                  fsr ? g_cfg.fsrSharpness : g_cfg.sharpness);
+    float sx = fsr ? g_cfg.fsrJitterSignX : g_cfg.jitterSignX, sy = fsr ? g_cfg.fsrJitterSignY : g_cfg.jitterSignY;
+    if (cs.jitterSet)
+        std::snprintf(b[3], sizeof b[3], "JITTER %u/%u, SIGN X%+.0f Y%+.0f   [K, J]", cs.jitterIdx + 1,
+                      cs.jitterPhases, sx, sy);
+    else std::snprintf(b[3], sizeof b[3], "JITTER OFF, SIGN X%+.0f Y%+.0f       [K, J]", sx, sy);
+    std::snprintf(b[4], sizeof b[4], "MOTION %s",
+                  !g_cfg.motionVectors ? "OFF                     [M]"
+                  : g_cfg.objectMotion ? "CAMERA + OBJECTS        [M]"
+                                       : "CAMERA ONLY             [M]");
+    std::snprintf(b[5], sizeof b[5], "FPS %.0f (%.1f MS)  [U]SWITCH [D]OFF [O]HIDE", g_fps,
+                  g_fps > 0.f ? 1000.f / g_fps : 0.f);
+    return std::vector<std::string>(std::begin(b), std::end(b));
+}
+
+// Draws the info box into outImage (in GENERAL, after the upscaler and sharpening).
+void RecordOverlay(DeviceData* d, VkCommandBuffer cb, Backend backend, const CmdState& cs, uint32_t inW,
+                   uint32_t inH) {
+    if (!g_cfg.overlay || !EnsureOverlay(d)) return;
+    uint32_t slot = (uint32_t)(g_dlss.ovCounter++ % kOvSlots);
+    uint32_t base = kOvFontWords + slot * kOvSlotWords;
+    char* text = g_dlss.ovPtr + base * 4;
+    std::memset(text, ' ', kOvSlotWords * 4);
+    std::vector<std::string> lines = OverlayLines(backend, cs, inW, inH);
+    for (uint32_t l = 0; l < kOvLines && l < lines.size(); ++l)
+        for (uint32_t c = 0; c < kOvCols && c < lines[l].size(); ++c)
+            text[l * kOvCols + c] = (char)std::toupper((unsigned char)lines[l][c]);
+    VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    b.image = g_dlss.outImage;
+    b.oldLayout = b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    b.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+    b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr,
+                          0, nullptr, 1, &b);
+    int32_t scale = std::max<int32_t>(1, (int32_t)g_dlss.outH / 720);  // 3 at 4K, 2 at 1440p
+    uint32_t w = (kOvCols * 6 + 3) * scale, h = (kOvLines * 9 + 3) * scale;
+    // overlay_x / overlay_y: position in percent of the screen, kept fully on screen
+    int32_t x = (int32_t)std::lround(g_cfg.overlayX / 100.0 * g_dlss.outW);
+    int32_t y = (int32_t)std::lround(g_cfg.overlayY / 100.0 * g_dlss.outH);
+    x = std::max(0, std::min(x, (int32_t)g_dlss.outW - (int32_t)w));
+    y = std::max(0, std::min(y, (int32_t)g_dlss.outH - (int32_t)h));
+    OvPush pc{{x, y}, {(int32_t)g_dlss.outW, (int32_t)g_dlss.outH}, scale, (int32_t)kOvLines, (int32_t)kOvCols,
+              (int32_t)base};
+    d->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_dlss.ovPipeline);
+    d->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_dlss.ovPipeLayout, 0, 1, &g_dlss.ovSet, 0, nullptr);
+    d->CmdPushConstants(cb, g_dlss.ovPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
+    d->CmdDispatch(cb, (w + 7) / 8, (h + 7) / 8, 1);
+    b.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr,
+                          0, nullptr, 1, &b);
+    g_dlss.ovSetUsed = true;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2845,6 +3145,7 @@ void RecordUpscale(DeviceData* d, VkCommandBuffer cb, CmdState& cs) {
     g_cap.outPending = false;
     if (ok && backend == Backend::Dlss) RecordSharpen(d, cb);  // FSR sharpens itself (RCAS)
     if (g_cfg.debugView && ok && (g_cfg.debugView == 2 || cs.mvPending)) RecordDebugView(d, cb, cs);
+    if (ok) RecordOverlay(d, cb, backend, cs, ci.w, ci.h);
 
     // back to the game's layouts; our output becomes sampleable for the blit
     Barrier(d, cb, g_dlss.outImage, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, RO);
@@ -2900,6 +3201,9 @@ VkDescriptorSet BlitSet(DeviceData* d, VkDescriptorSet gameSet, uint32_t binding
         pi.maxSets = 16;
         pi.poolSizeCount = (uint32_t)(sizeof sizes / sizeof sizes[0]);
         pi.pPoolSizes = sizes;
+        // The game's blit layout may be update-after-bind; such sets must come from a pool with that flag
+        // (a pool with it also serves ordinary layouts).
+        if (g_updateAfterBindLayouts.count(lo->second)) pi.flags |= VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT;
         if (d->CreateDescriptorPool(d->device, &pi, nullptr, &g_dlss.pool) != VK_SUCCESS) return VK_NULL_HANDLE;
         VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
         si.magFilter = si.minFilter = VK_FILTER_LINEAR;
@@ -3314,7 +3618,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_CreateDevice(VkPhysicalDevice physical
     }
     VkDeviceCreateInfo ci = *pCreateInfo;
     // Add the device extensions NGX needs (only those the GPU supports).
-    bool addedBda = false;
+    bool addedBda = false, addedBdaExt = false;
     unsigned int ni = 0, nd = 0;
     const char** iexts = nullptr;
     const char** dexts = nullptr;
@@ -3328,6 +3632,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_CreateDevice(VkPhysicalDevice physical
             }
             exts.push_back(dexts[i]);
             if (!std::strcmp(dexts[i], VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME)) addedBda = true;
+            if (!std::strcmp(dexts[i], VK_EXT_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME)) addedBdaExt = true;
             Log("[device] + %s (for DLSS)", dexts[i]);
         }
     // buffer_device_address needs its feature switched on as well
@@ -3343,6 +3648,19 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_CreateDevice(VkPhysicalDevice physical
             bda.pNext = const_cast<void*>(ci.pNext);
             ci.pNext = &bda;
         }
+    }
+    // NGX asks for the EXT version on a Vulkan 1.1 game; it has its own feature structure (another sType),
+    // and NGX calls vkGetBufferDeviceAddressEXT, which needs the feature on (validation error otherwise).
+    VkPhysicalDeviceBufferDeviceAddressFeaturesEXT bdaExt{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES_EXT};
+    if (addedBdaExt && !addedBda &&
+        !FindInChain(pCreateInfo->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES_EXT) &&
+        !FindInChain(pCreateInfo->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES) &&
+        !FindInChain(pCreateInfo->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES)) {
+        bdaExt.bufferDeviceAddress = VK_TRUE;
+        bdaExt.pNext = const_cast<void*>(ci.pNext);
+        ci.pNext = &bdaExt;
+        Log("[device] bufferDeviceAddress feature switched on (for DLSS)");
     }
     FeaturePatch fp;
     size_t extsBeforeFsr = exts.size();
@@ -4139,6 +4457,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_CreateDescriptorSetLayout(VkDevice dev
         std::sort(b.begin(), b.end(), [](const LayoutBinding& x, const LayoutBinding& y) { return x.binding < y.binding; });
         std::lock_guard<std::recursive_mutex> lk(g_t);
         g_setLayouts[*pLayout] = std::move(b);
+        if (pInfo->flags & VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT)
+            g_updateAfterBindLayouts.insert(*pLayout);
     }
     return r;
 }
@@ -4724,6 +5044,10 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_QueuePresentKHR(VkQueue queue, const V
         //   Ctrl+Shift+Y  automated small-tilt wobble test, records 8 frames in a row
         //   Ctrl+Shift+L  log every draw into the 3D scene for one frame
         //   Ctrl+Shift+J  jitter on/off
+        //   Ctrl+Shift+O  on-screen info box on/off
+        //   Ctrl+Shift+Up/Down  sharpness of the running upscaler +/- 0.1 (sharpness / fsr_sharpness)
+        //   Ctrl+Shift+K  jitter sign of the running upscaler: X+Y+ -> X-Y+ -> X+Y- -> X-Y-
+        // Changes made with keys last until tf3_dlss.cfg is saved again.
         DWORD fgPid = 0;
         GetWindowThreadProcessId(GetForegroundWindow(), &fgPid);
         bool focused = fgPid == GetCurrentProcessId();
@@ -4754,6 +5078,33 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_QueuePresentKHR(VkQueue queue, const V
             g_cfg.jitter = g_cfg.jitter ? 0 : 1;
             g_dlss.resetNext = true;
             Log("[jitter] Ctrl+Shift+J: jitter %s (frame %llu)", g_cfg.jitter ? "ON" : "OFF", (unsigned long long)g_frame);
+        }
+        static bool oWasDown = false, upWasDown = false, downWasDown = false, kWasDown = false;
+        if (devPressed('O', oWasDown)) {
+            g_cfg.overlay = g_cfg.overlay ? 0 : 1;
+            Log("[overlay] Ctrl+Shift+O: info box %s (frame %llu)", g_cfg.overlay ? "ON" : "OFF",
+                (unsigned long long)g_frame);
+        }
+        bool up = devPressed(VK_UP, upWasDown), down = devPressed(VK_DOWN, downWasDown);
+        if (up || down) {
+            bool fsr = g_dlss.backend == Backend::Fsr;
+            float& sh = fsr ? g_cfg.fsrSharpness : g_cfg.sharpness;
+            float s = std::lround((sh + (up ? 0.1f : -0.1f)) * 10.f) / 10.f;
+            sh = std::min(std::max(s, 0.f), 1.f);
+            Log("[sharpen] Ctrl+Shift+%s: %s sharpness %.1f (frame %llu)", up ? "Up" : "Down", fsr ? "FSR" : "DLSS", sh,
+                (unsigned long long)g_frame);
+        }
+        if (devPressed('K', kWasDown)) {  // cycle the sign pair of the upscaler that is running
+            bool fsr = g_dlss.backend == Backend::Fsr;
+            float& sx = fsr ? g_cfg.fsrJitterSignX : g_cfg.jitterSignX;
+            float& sy = fsr ? g_cfg.fsrJitterSignY : g_cfg.jitterSignY;
+            int i = (sx < 0 ? 1 : 0) + (sy < 0 ? 2 : 0);  // 0: ++, 1: -+, 2: +-, 3: --
+            i = (i + 1) % 4;
+            sx = (i & 1) ? -1.f : 1.f;
+            sy = (i & 2) ? -1.f : 1.f;
+            g_dlss.resetNext = true;
+            Log("[jitter] Ctrl+Shift+K: %s jitter sign x=%g y=%g (frame %llu)", fsr ? "FSR" : "DLSS", sx, sy,
+                (unsigned long long)g_frame);
         }
         static bool lWasDown = false;
         if (devPressed('L', lWasDown)) {
@@ -4829,6 +5180,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_QueuePresentKHR(VkQueue queue, const V
             }
         }
         ProbeReport();
+        CountFrameForFps();
         if (LogFrame(g_frame)) {
             Log("[frame] %llu: dlss %s, blit swapped %s", (unsigned long long)g_frame,
                 g_lastDlssFrame == g_frame ? "ran" : "did not run", g_lastSwapFrame == g_frame ? "yes" : "no");

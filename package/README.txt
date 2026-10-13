@@ -52,7 +52,8 @@ upscaler=auto is the default: DLSS on NVIDIA RTX cards, FSR 3.1 otherwise.
 To use FSR on an NVIDIA card, set upscaler=fsr in tf3_dlss.cfg.
 
 Other useful settings:
-  sharpness=0.3   sharpening, 0 (off) to 1
+  sharpness=0.3       DLSS sharpening, 0 (off) to 1
+  fsr_sharpness=0.5   FSR sharpening, 0 (off) to 1
   preset=11       DLSS model (K); 13 (M) can look better at 50% on RTX 40/50
   mip_bias=auto   sharper ground textures; set -1 if fine patterns shimmer
 

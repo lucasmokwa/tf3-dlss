@@ -1,0 +1,43 @@
+#version 450
+// On-screen info box (overlay=1 in tf3_dlss.cfg, or Ctrl+Shift+O with debug_keys=1): a few lines of
+// text drawn into the upscaled image, top left. The 5x7 font and the text come from a host-visible
+// buffer the layer fills: words 0..127 are the font (two words per glyph, ASCII 32..95), the text is
+// one byte per character, `cols` characters per line, starting at word `textBase`.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0, rgba8) uniform image2D img;  // upscaled output
+layout(set = 0, binding = 1, std430) readonly buffer Data { uint words[]; };
+
+layout(push_constant) uniform Params {
+    ivec2 origin;   // top-left corner of the box, output pixels
+    ivec2 size;     // output image size
+    int scale;      // output pixels per font pixel
+    int lines;
+    int cols;
+    int textBase;   // first word of this frame's text
+} pc;
+
+const int kCellW = 6, kCellH = 9;  // 5x7 glyph plus spacing
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 box = ivec2(pc.cols * kCellW + 3, pc.lines * kCellH + 3) * pc.scale;
+    ivec2 q = pc.origin + p;
+    if (any(greaterThanEqual(p, box)) || any(greaterThanEqual(q, pc.size))) return;
+    vec3 col = imageLoad(img, q).rgb * 0.3;  // darkened background
+    ivec2 c = p / pc.scale - ivec2(2);       // font pixels, 2 pixels of padding
+    if (c.x >= 0 && c.y >= 0) {
+        int line = c.y / kCellH, ch = c.x / kCellW;
+        int gx = c.x % kCellW, gy = c.y % kCellH;
+        if (line < pc.lines && ch < pc.cols && gx < 5 && gy < 7) {
+            int idx = line * pc.cols + ch;
+            uint code = (words[pc.textBase + idx / 4] >> (8 * (idx % 4))) & 0xFFu;
+            uint g = (code >= 32u && code < 96u) ? code - 32u : 0u;
+            uint bits = words[g * 2u + (gy < 4 ? 0u : 1u)];
+            int row = gy < 4 ? gy : gy - 4;
+            if (((bits >> uint(row * 5 + (4 - gx))) & 1u) != 0u) col = vec3(1.0, 0.95, 0.6);
+        }
+    }
+    imageStore(img, q, vec4(col, 1.0));
+}
