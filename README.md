@@ -1,13 +1,14 @@
 # TF3-DLSS
 
+**[⬇ Download the latest release](https://github.com/lucasmokwa/tf3-dlss/releases/latest)** (unzip it and follow the `README.txt` inside)
+
 DLSS and FSR 3.1 for **Transport Fever 3**, added through a Vulkan layer. The game keeps rendering
 at its own (lower) resolution, and the layer replaces the game's built-in FSR 1 upscale with
 NVIDIA DLSS (RTX cards) or AMD FSR 3.1 (any GPU).
 
 Unofficial and experimental. Not affiliated with Urban Games, NVIDIA or AMD.
 
-**Players:** download the zip from the [Releases](../../releases) page and follow the `README.txt`
-inside. This page is about the source.
+The rest of this page is about the source.
 
 ## How it works
 
@@ -59,9 +60,17 @@ Vulkan loader uses one of them, so uninstall the release while developing.
 
 ## Releasing
 
+Releases are built and published by GitHub Actions (`.github/workflows/release.yml`):
+
 1. Bump `TF3_DLSS_VERSION` in `layer/src/layer.cpp`, the manifests' `implementation_version`, and the version in `package/README.txt`.
-2. `.\build.ps1`, test, then `.\package.ps1`. That checks the cfg has developer options off and writes `dist\TF3-DLSS-<version>.zip`.
-3. Create a GitHub release with that zip attached. Binaries are never committed.
+2. Test locally (`.\build.ps1`, then in game), and make sure `tf3_dlss.cfg` has the developer options off.
+3. Push to `main`. If there's no release `v<version>` yet, the workflow builds, runs `package.ps1` and
+   publishes the release with `TF3-DLSS-<version>.zip` attached. Pushes that don't change the version
+   publish nothing. Binaries are never committed.
+
+The CI build fetches the DLSS SDK from [NVIDIA/DLSS](https://github.com/NVIDIA/DLSS) at the tag in
+`DLSS_SDK_REF`, the Vulkan SDK from LunarG and the FSR runtime with `get_fsr.ps1`. Pull requests get the
+same build, with the zip under the run's artifacts instead of a release.
 
 ## Hotkeys
 
