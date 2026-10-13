@@ -1,14 +1,52 @@
 # TF3-DLSS
 
-**[⬇ Download the latest release](https://github.com/lucasmokwa/tf3-dlss/releases/latest)** (unzip it and follow the `README.txt` inside)
+NVIDIA DLSS and AMD FSR 3.1 for **Transport Fever 3**. The mod replaces the game's built-in FSR 1
+upscaler for a sharper, steadier image at the same frame rate, or more frames for the same image.
+Unofficial and experimental; not affiliated with Urban Games, NVIDIA or AMD.
 
-DLSS and FSR 3.1 for **Transport Fever 3**, added through a Vulkan layer. The game keeps rendering
-at its own (lower) resolution, and the layer replaces the game's built-in FSR 1 upscale with
-NVIDIA DLSS (RTX cards) or AMD FSR 3.1 (any GPU).
+**[⬇ Download the latest release](https://github.com/lucasmokwa/tf3-dlss/releases/latest)**
 
-Unofficial and experimental. Not affiliated with Urban Games, NVIDIA or AMD.
+## Install
 
-The rest of this page is about the source.
+You need Windows 10 or 11 and Transport Fever 3 on Steam. DLSS needs an NVIDIA RTX card (20 series or
+newer); FSR 3.1 works on any GPU, and the mod picks the right one for you.
+
+1. Unzip the `TF3-DLSS` folder somewhere it can stay, for example `C:\Games\TF3-DLSS`. Not inside
+   `Program Files`.
+2. Double-click `install.bat`. It registers the mod for your Windows user: no administrator rights,
+   no game files changed. If Windows asks whether to run it, choose *Run*.
+3. Start the game from Steam and pick a **Resolution scale** in its graphics options:
+   67% (Quality) or 50% (Performance) for more frames, or 100% for native-resolution anti-aliasing
+   (DLAA).
+
+In game, **Ctrl+Shift+D** turns the upscaler on and off (to compare with the game's own) and
+**Ctrl+Shift+U** switches between DLSS and FSR. Settings are in `tf3_dlss.cfg` in the mod folder;
+every line is explained there.
+
+**Update:** close the game and replace the folder's contents with the new zip's. If the folder moved,
+run `install.bat` again from the new place.
+**Uninstall:** double-click `uninstall.bat`, then delete the folder.
+**Not working?** See `README.txt` in the folder. If the mod couldn't start, it leaves a
+`TF3-DLSS-DID-NOT-START.txt` there that says why. Bug reports: attach `tf3_dlss.log` from the same
+folder, with your GPU and resolution scale.
+
+### Why is there an install script?
+
+Vulkan games don't load a DLL dropped into the game folder. The Vulkan loader only loads layers
+registered under `HKCU\SOFTWARE\Khronos\Vulkan\ImplicitLayers`, by the absolute path of the layer's
+`.json` file, so something has to write that path once. `install.bat` runs `bin\tf3_dlss_setup.ps1`,
+which writes that one registry value; `uninstall.bat` removes it. The layer is then offered to every
+Vulkan program but switches itself off in everything except `TransportFever3.exe`.
+
+## Known limitations
+
+- People and animals (skinned models) get camera motion only.
+- Smoke, clouds and other effects without depth get no motion vectors and can trail.
+- Vulkan renderer only (TF3's only renderer).
+
+---
+
+The rest of this page is for developers.
 
 ## How it works
 
@@ -91,12 +129,6 @@ With `debug_keys=1` in the cfg:
 | Ctrl+Shift+T | automated camera test, recorded to `mvcap/` next to the log |
 | Ctrl+Shift+Y | automated quick-tilt test, records 8 frames in a row |
 | Ctrl+Shift+L | log every 3D scene draw of one frame (pipeline state) |
-
-## Known limitations
-
-- People and animals (skinned models) get camera motion only.
-- Smoke, clouds and other effects without depth get no motion vectors and can trail.
-- Vulkan renderer only (TF3's only renderer).
 
 ## License
 

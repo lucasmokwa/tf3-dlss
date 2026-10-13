@@ -34,8 +34,8 @@ try {
             Write-Host 'TF3-DLSS is installed.' -ForegroundColor Green
             Write-Host "  Layer: $manifest"
             Write-Host ''
-            Write-Host 'Start Transport Fever 3 as usual (from Steam), and set the game''s'
-            Write-Host 'Resolution scale below 100% in its graphics options.'
+            Write-Host 'Start Transport Fever 3 as usual (from Steam) and pick a Resolution scale in its'
+            Write-Host 'graphics options: 67% or 50% for more frames, 100% for native anti-aliasing (DLAA).'
             Write-Host 'Do not move or rename this folder: run uninstall.bat first, then install.bat again.'
         }
         'uninstall' {
