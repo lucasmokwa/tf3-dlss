@@ -1,0 +1,132 @@
+# Every push to main builds the layer and publishes a GitHub release:
+#   - TF3_DLSS_VERSION from layer/src/layer.cpp, if that version has no release yet and is newer
+#     than the latest release (a hand bump, e.g. to 1.0.0);
+#   - otherwise the next minor version after the latest release (0.2.0 -> 0.3.0).
+# The CI build stamps that version into its own copy of layer.cpp, the layer manifests and
+# package/README.txt; nothing is committed back. Pushes that only change Markdown files are skipped.
+# Pull requests get the same build, with the zip kept as a workflow artifact instead of a release.
+name: Build and release
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['**.md']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  VULKAN_SDK_VERSION: 1.4.363.0
+  # NVIDIA DLSS SDK tag (https://github.com/NVIDIA/DLSS/tags). Keep it the same as the local SDK.
+  DLSS_SDK_REF: v310.9.1
+
+jobs:
+  # Works out the version on a cheap Linux runner.
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      publish: ${{ steps.v.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          src=$(sed -n 's/^#define TF3_DLSS_VERSION "\(.*\)"/\1/p' layer/src/layer.cpp)
+          [ -n "$src" ] || { echo "TF3_DLSS_VERSION not found in layer/src/layer.cpp"; exit 1; }
+          latest=$(gh api "repos/$GITHUB_REPOSITORY/releases" --paginate --jq '.[].tag_name' \
+                   | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sed 's/^v//' | sort -V | tail -1)
+          if [ -z "$latest" ] || [ "$(printf '%s\n%s\n' "$latest" "$src" | sort -V | tail -1)" != "$latest" ]; then
+            ver=$src
+          else
+            IFS=. read -r major minor _ <<< "$latest"
+            ver="$major.$((minor + 1)).0"
+          fi
+          publish=false
+          if [ "$GITHUB_EVENT_NAME" != pull_request ] && [ "$GITHUB_REF" = refs/heads/main ]; then
+            publish=true
+          fi
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+          echo "layer.cpp $src, latest release ${latest:-none} -> version $ver, publish=$publish"
+
+  build:
+    needs: version
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Only the headers and Windows libraries/runtimes of the DLSS SDK (the repo is large).
+      - name: Get the NVIDIA DLSS SDK
+        uses: actions/checkout@v4
+        with:
+          repository: NVIDIA/DLSS
+          ref: ${{ env.DLSS_SDK_REF }}
+          path: _sdk/DLSS
+          sparse-checkout: |
+            include
+            lib/Windows_x86_64
+          sparse-checkout-cone-mode: true
+
+      - name: Cache the Vulkan SDK
+        id: vk-cache
+        uses: actions/cache@v4
+        with:
+          path: C:\VulkanSDK\${{ env.VULKAN_SDK_VERSION }}
+          key: vulkan-sdk-${{ env.VULKAN_SDK_VERSION }}
+
+      - name: Install the Vulkan SDK
+        if: steps.vk-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $ver = $env:VULKAN_SDK_VERSION
+          $exe = Join-Path $env:RUNNER_TEMP 'vulkan_sdk.exe'
+          Invoke-WebRequest "https://sdk.lunarg.com/sdk/download/$ver/windows/vulkan_sdk.exe" -OutFile $exe -UseBasicParsing
+          $p = Start-Process $exe -ArgumentList '--root', "C:\VulkanSDK\$ver", '--accept-licenses', '--default-answer', '--confirm-command', 'install' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "Vulkan SDK install failed (exit $($p.ExitCode))" }
+
+      - name: Stamp the version
+        shell: bash
+        env:
+          VER: ${{ needs.version.outputs.version }}
+        run: |
+          IFS=. read -r major minor patch <<< "$VER"
+          impl=$((major * 10000 + minor * 100 + patch))
+          sed -i "s/^#define TF3_DLSS_VERSION \".*\"/#define TF3_DLSS_VERSION \"$VER\"/" layer/src/layer.cpp
+          sed -i "s/\"implementation_version\": \"[0-9]*\"/\"implementation_version\": \"$impl\"/" layer/*.json
+          sed -i "1s/^TF3-DLSS [0-9.]*/TF3-DLSS $VER/" package/README.txt
+          git diff --stat
+
+      - name: Build
+        shell: pwsh
+        run: |
+          $env:VULKAN_SDK = "C:\VulkanSDK\$env:VULKAN_SDK_VERSION"
+          .\scripts\get_fsr.ps1
+          .\scripts\build.ps1 -DlssSdk "$env:GITHUB_WORKSPACE\_sdk\DLSS"
+
+      - name: Package
+        shell: pwsh
+        run: .\scripts\package.ps1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TF3-DLSS-${{ needs.version.outputs.version }}
+          path: dist/TF3-DLSS-${{ needs.version.outputs.version }}.zip
+
+      - name: Publish the release
+        if: needs.version.outputs.publish == 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VER: ${{ needs.version.outputs.version }}
+        run: |
+          gh release create "v$env:VER" "dist\TF3-DLSS-$env:VER.zip" `
+            --target $env:GITHUB_SHA --title "TF3-DLSS $env:VER" --generate-notes
+          if ($LASTEXITCODE -ne 0) { throw "gh release create failed (exit $LASTEXITCODE)" }
