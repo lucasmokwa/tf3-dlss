@@ -16,33 +16,34 @@ REQUIREMENTS
 
 INSTALL
 -------
-1. Unzip the TF3-DLSS folder somewhere permanent, for example
-   C:\Games\TF3-DLSS. Not inside "Program Files" (the log can't be written
-   there).
-2. Double-click install.bat. It registers the mod for your Windows user; no
-   administrator rights, and no game files are touched. If Windows asks
-   whether to run it, choose "Run".
+1. Open the game folder: in Steam, right-click Transport Fever 3, then
+   Manage > Browse local files.
+2. Copy everything from the zip into that folder, next to
+   TransportFever3.exe: version.dll and the TF3-DLSS folder. No game files
+   are replaced, and nothing is installed anywhere else.
 3. Start the game as usual and pick a "Resolution scale" in the game's
    graphics options: 67% (Quality) or 50% (Performance) for more frames,
    or 100% for native-resolution anti-aliasing (DLAA, no speed-up).
 
-If you move or rename the folder later, run uninstall.bat first and
-install.bat again from the new place.
+version.dll is a small stand-in for the Windows file of the same name: the
+game loads it from its own folder, it tells Vulkan where the mod is (for this
+game only), and passes everything else on to the real version.dll.
 
 
 UPDATE
 ------
-Close the game and replace this folder's contents with the new zip's. If
-you put the new version somewhere else, run install.bat again from there.
+Close the game and copy the new zip's contents over the old ones.
 
 
 USING IT
 --------
-Ctrl+Shift+D   upscaler on / off (off = the game's own FSR 1, to compare)
-Ctrl+Shift+U   switch between DLSS and FSR 3.1 (NVIDIA RTX cards)
-
 Settings are in tf3_dlss.cfg (open it with Notepad). Every line is explained
 there. Most changes apply while the game runs, as soon as you save the file.
+
+To compare with the game's own upscaling, set debug_keys=1 in tf3_dlss.cfg.
+Then, in game:
+  Ctrl+Shift+D   upscaler on / off (off = the game's own FSR 1)
+  Ctrl+Shift+U   switch between DLSS and FSR 3.1 (NVIDIA RTX cards)
 
 
 CHOOSING AN UPSCALER
@@ -59,21 +60,22 @@ Other useful settings:
 IF SOMETHING IS WRONG
 ---------------------
 - No change in game? Look for TF3-DLSS-DID-NOT-START.txt in this folder (or
-  in %TEMP%). It says why the upscaler didn't run. Common reasons: install.bat
-  wasn't run, the folder was moved after installing (run install.bat
-  again), or DLSS isn't available on the GPU (set upscaler=fsr).
+  in %TEMP%). It says why the upscaler didn't run, for example DLSS isn't
+  available on the GPU (set upscaler=fsr). If there is neither that file nor
+  tf3_dlss.log, the mod wasn't loaded: check that version.dll and the
+  TF3-DLSS folder are directly next to TransportFever3.exe.
 - tf3_dlss.log in this folder (or %TEMP%) has the details. Please attach it
   to any bug report, with your GPU and the render scale you use.
 - Smearing or ghosting behind moving things: people and animals currently get
   camera motion only, and smoke/clouds have no depth, so some trails there
   are expected. Anything else: please report it.
-- To rule the mod out completely, run uninstall.bat (or set the environment
+- To rule the mod out completely, uninstall it (or set the environment
   variable TF3_DLSS_DISABLE=1).
 
 
 UNINSTALL
 ---------
-Double-click uninstall.bat, then delete this folder.
+Delete version.dll and the TF3-DLSS folder from the game folder.
 
 
 CREDITS AND LICENSES
