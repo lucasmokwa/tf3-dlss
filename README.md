@@ -129,6 +129,11 @@ With `debug_keys=1` in the cfg:
 | Ctrl+Shift+T | automated camera test, recorded to `mvcap/` next to the log |
 | Ctrl+Shift+Y | automated quick-tilt test, records 8 frames in a row |
 | Ctrl+Shift+L | log every 3D scene draw of one frame (pipeline state) |
+| Ctrl+Shift+O | on-screen info box on / off (`overlay` in the cfg) |
+| Ctrl+Shift+Up / Down | sharpness of the running upscaler +0.1 / -0.1 |
+| Ctrl+Shift+K | jitter sign of the running upscaler: x+y+ -> x-y+ -> x+y- -> x-y- |
+
+Changes made with these keys last until the cfg file is saved again.
 
 ## License
 
