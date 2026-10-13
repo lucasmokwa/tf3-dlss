@@ -2470,6 +2470,7 @@ struct Fsr {
     PfnFfxDispatch dispatch = nullptr;
     PfnFfxQuery query = nullptr;
     ffxContext ctx = nullptr;
+    VkPhysicalDevice appPhysicalDevice = VK_NULL_HANDLE;  // the loader's handle for our GPU (see AppPhysicalDevice)
     uint32_t inW = 0, inH = 0, outW = 0, outH = 0;
     int debugInUse = -1, srgbInUse = -1;
     double lastMs = 0;
@@ -2514,6 +2515,54 @@ bool FsrLoad() {
     return g_fsr.available;
 }
 
+// The FSR runtime calls instance functions (vkGetPhysicalDeviceProperties, ...) through vulkan-1.dll,
+// i.e. the loader's trampolines, which only accept the application's physical-device handles. The
+// handle a layer sees in vkCreateDevice is the loader's unwrapped one; passing that to FSR makes the
+// loader abort the process. So ask the loader for its handles and pick the one for our GPU (by UUID).
+// Caller holds g_t.
+VkPhysicalDevice AppPhysicalDevice(DeviceData* d) {
+#ifdef _WIN32
+    if (g_fsr.appPhysicalDevice) return g_fsr.appPhysicalDevice;
+    HMODULE vk = GetModuleHandleW(L"vulkan-1.dll");
+    auto enumerate = vk ? (PFN_vkEnumeratePhysicalDevices)(void*)GetProcAddress(vk, "vkEnumeratePhysicalDevices") : nullptr;
+    auto loaderProps2 =
+        vk ? (PFN_vkGetPhysicalDeviceProperties2)(void*)GetProcAddress(vk, "vkGetPhysicalDeviceProperties2") : nullptr;
+    InstanceData* inst = d->instance;
+    auto ourProps2 = inst ? (PFN_vkGetPhysicalDeviceProperties2)inst->GetInstanceProcAddr(
+                                inst->instance, "vkGetPhysicalDeviceProperties2")
+                          : nullptr;
+    if (!enumerate || !loaderProps2 || !ourProps2) {
+        Log("[fsr] can't reach the Vulkan loader's functions (vulkan-1.dll %s)", vk ? "loaded" : "not loaded");
+        return VK_NULL_HANDLE;
+    }
+    auto uuid = [](PFN_vkGetPhysicalDeviceProperties2 fn, VkPhysicalDevice pd, uint8_t out[VK_UUID_SIZE]) {
+        VkPhysicalDeviceIDProperties id{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
+        VkPhysicalDeviceProperties2 p{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+        p.pNext = &id;
+        fn(pd, &p);
+        std::memcpy(out, id.deviceUUID, VK_UUID_SIZE);
+    };
+    uint8_t ours[VK_UUID_SIZE];
+    uuid(ourProps2, d->physicalDevice, ours);
+    uint32_t n = 0;
+    enumerate(inst->instance, &n, nullptr);
+    std::vector<VkPhysicalDevice> pds(n);
+    if (n) enumerate(inst->instance, &n, pds.data());
+    for (uint32_t i = 0; i < n; ++i) {
+        uint8_t theirs[VK_UUID_SIZE];
+        uuid(loaderProps2, pds[i], theirs);
+        if (!std::memcmp(ours, theirs, VK_UUID_SIZE)) {
+            g_fsr.appPhysicalDevice = pds[i];
+            Log("[fsr] GPU handle for the FSR runtime: %s (layer handle %s, %u GPUs)", H(pds[i]).c_str(),
+                H(d->physicalDevice).c_str(), n);
+            return pds[i];
+        }
+    }
+    Log("[fsr] none of the loader's %u GPUs matches ours", n);
+#endif
+    return VK_NULL_HANDLE;
+}
+
 // (Re)create the FSR context for the current sizes. Caller holds g_t.
 bool FsrEnsure(DeviceData* d) {
     int dbg = g_cfg.fsrDebug ? 1 : 0;
@@ -2527,10 +2576,17 @@ bool FsrEnsure(DeviceData* d) {
         g_fsr.destroy(&g_fsr.ctx, nullptr);
         g_fsr.ctx = nullptr;
     }
+    VkPhysicalDevice appPd = AppPhysicalDevice(d);
+    if (!appPd) {
+        g_fsr.why = "FSR 3.1 could not find the GPU through the Vulkan loader";
+        g_fsr.failed = true;
+        Log("[fsr] %s", g_fsr.why.c_str());
+        return false;
+    }
     ffxCreateBackendVKDesc be{};
     be.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK;
     be.vkDevice = d->device;
-    be.vkPhysicalDevice = d->physicalDevice;
+    be.vkPhysicalDevice = appPd;  // the loader's handle: FSR calls instance functions through vulkan-1.dll
     be.vkDeviceProcAddr = d->GetDeviceProcAddr;  // the next layer's: FSR's commands bypass our hooks
     ffxCreateContextDescUpscale cd{};
     cd.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
@@ -2542,6 +2598,7 @@ bool FsrEnsure(DeviceData* d) {
     cd.maxRenderSize = {g_dlss.inW, g_dlss.inH};
     cd.maxUpscaleSize = {g_dlss.outW, g_dlss.outH};
     cd.fpMessage = &FfxMessage;
+    Log("[fsr] creating the context (%ux%u -> %ux%u)", g_dlss.inW, g_dlss.inH, g_dlss.outW, g_dlss.outH);
     ffxReturnCode_t r = g_fsr.create(&g_fsr.ctx, &cd.header, nullptr);
     if (r != FFX_API_RETURN_OK || !g_fsr.ctx) {
         char b[96];
@@ -2627,6 +2684,7 @@ void DestroyFsr(DeviceData* d) {
         g_fsr.ctx = nullptr;
     }
     g_fsr.inW = g_fsr.inH = g_fsr.outW = g_fsr.outH = 0;
+    g_fsr.appPhysicalDevice = VK_NULL_HANDLE;
 }
 
 // ---------------------------------------------------------------------------------------------
