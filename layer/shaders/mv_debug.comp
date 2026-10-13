@@ -1,0 +1,91 @@
+#version 450
+// Debug views, drawn over the DLSS output (Ctrl+Shift+V cycles them):
+//
+// mode 1 - motion vectors
+//   Pixels written by the object pass show only the object's own motion (minus the camera's),
+//   scaled by debug_object_scale; everything else shows camera motion scaled by debug_scale.
+//   grey            = no motion
+//   red / cyan      = moving +x / -x (pixels per frame, scaled)
+//   green / magenta = moving +y / -y
+//
+// mode 2 - jitter
+//   Background: the raw, jittered DLSS input, enlarged with nearest-neighbour sampling, so the
+//   sub-pixel shift between frames is visible as a shimmer of the blocky pixels.
+//   Inset (centre of the screen): one render pixel drawn large, with the whole jitter pattern
+//   (grey dots), the offset applied to the camera this frame (red) and the offset DLSS is told
+//   about (green). Red and green should sit on top of each other; if they mirror each other,
+//   a jitter_sign setting is wrong.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D mvTex;  // final motion vectors (camera + objects), render res
+layout(set = 0, binding = 3, std430) readonly buffer CamMv { uint camMv[]; };  // camera-only motion (packed half2)
+layout(set = 0, binding = 1, rgba8) uniform writeonly image2D outImg;      // DLSS output, display res
+layout(set = 0, binding = 2) uniform sampler2D colorIn;                    // DLSS input colour, render res
+
+layout(push_constant) uniform Params {
+    ivec2 inSize;
+    ivec2 outSize;
+    float scale;       // motion view: colour change per pixel of motion
+    int mode;          // 1 = motion vectors, 2 = jitter
+    int phases;        // jitter pattern length
+    int phaseIndex;    // current Halton index (1-based)
+    vec2 jitterApplied;  // pixels, as applied to the camera
+    vec2 jitterSent;     // pixels, as passed to DLSS
+    float objScale;      // motion view: colour change per pixel of object motion
+} pc;
+
+float halton(int i, int b) {
+    float f = 1.0, r = 0.0;
+    while (i > 0) {
+        f /= float(b);
+        r += f * float(i % b);
+        i /= b;
+    }
+    return r;
+}
+
+bool nearPoint(vec2 p, vec2 c, float radius) { return distance(p, c) <= radius; }
+
+void main() {
+    ivec2 o = ivec2(gl_GlobalInvocationID.xy);
+    if (o.x >= pc.outSize.x || o.y >= pc.outSize.y) return;
+    ivec2 i = min(o * pc.inSize / pc.outSize, pc.inSize - 1);
+
+    if (pc.mode == 1) {
+        vec2 m = texelFetch(mvTex, i, 0).rg;
+        vec2 cam = unpackHalf2x16(camMv[i.y * pc.inSize.x + i.x]);
+        vec2 obj = m - cam;  // what the object pass added on top of the camera motion
+        vec3 c = vec3(0.5) + vec3(m.x, m.y, -m.x) * pc.scale;
+        // Only real object movement (> 0.25 px beyond the camera's): parked copies of moving models
+        // differ by rounding only (~0.05 px), which would show up as speckles at this scale.
+        if (dot(obj, obj) > 0.0625) c = vec3(0.5) + vec3(obj.x, obj.y, -obj.x) * pc.objScale;
+        imageStore(outImg, o, vec4(clamp(c, 0.0, 1.0), 1.0));
+        return;
+    }
+
+    // mode 2: jitter
+    vec3 col = texelFetch(colorIn, i, 0).rgb;
+
+    // Inset in the middle of the screen; rows run top-down, like the jitter offsets.
+    const float box = 480.0;
+    vec2 origin = (vec2(pc.outSize) - box) * 0.5;  // box spans origin..origin+box
+    vec2 p = vec2(o) + 0.5;
+    vec2 local = (p - origin) / box;  // 0..1 inside the box, covering offsets -0.5..+0.5
+    if (all(greaterThanEqual(local, vec2(-0.02))) && all(lessThanEqual(local, vec2(1.02)))) {
+        vec3 c = vec3(0.08);
+        bool border = any(lessThan(local, vec2(0.0))) || any(greaterThan(local, vec2(1.0)));
+        if (border) c = vec3(0.9);
+        else {
+            if (abs(local.x - 0.5) * box < 1.0 || abs(local.y - 0.5) * box < 1.0) c = vec3(0.35);  // pixel centre
+            for (int k = 1; k <= pc.phases; ++k) {
+                vec2 j = vec2(halton(k, 2), halton(k, 3));  // 0..1 == offset + 0.5
+                if (nearPoint(p, origin + j * box, 4.0)) c = vec3(0.55);
+            }
+            if (nearPoint(p, origin + (pc.jitterSent + 0.5) * box, 9.0)) c = vec3(0.1, 0.9, 0.2);
+            if (nearPoint(p, origin + (pc.jitterApplied + 0.5) * box, 6.0)) c = vec3(1.0, 0.15, 0.1);
+        }
+        col = c;
+    }
+    imageStore(outImg, o, vec4(clamp(col, 0.0, 1.0), 1.0));
+}

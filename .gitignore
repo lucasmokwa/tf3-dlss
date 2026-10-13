@@ -1,0 +1,22 @@
+# Build output and packaged releases (binaries go on the GitHub Releases page, not in git)
+build/
+dist/
+*.dll
+*.pdb
+*.exe
+*.zip
+
+# Local test output
+logs/
+captures/
+*.log
+TF3-DLSS-DID-NOT-START.txt
+
+# Copy of the game's own shader sources: Urban Games' work, kept locally for reference only
+game_shaders/
+
+# Editors
+.vs/
+.vscode/
+.idea/
+*.user

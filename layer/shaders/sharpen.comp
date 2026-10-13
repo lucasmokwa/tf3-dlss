@@ -1,0 +1,36 @@
+#version 450
+// Optional sharpening after DLSS (sharpness setting in tf3_dlss.cfg; 0 = off).
+// Contrast-adaptive sharpening in the style of AMD FidelityFX CAS (cross pattern): each pixel is
+// pushed away from its four neighbours, less where local contrast is already high, so edges don't
+// ring and flat areas don't pick up noise. Reads the DLSS output, writes a temporary image that the
+// layer copies back.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D src;              // DLSS output
+layout(set = 0, binding = 1, rgba8) uniform writeonly image2D dst;
+
+layout(push_constant) uniform Params {
+    ivec2 size;
+    float sharpness;  // 0..1
+} pc;
+
+vec3 at(ivec2 p) { return texelFetch(src, clamp(p, ivec2(0), pc.size - 1), 0).rgb; }
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(p, pc.size))) return;
+    vec3 b = at(p + ivec2(0, -1));
+    vec3 d = at(p + ivec2(-1, 0));
+    vec3 e = at(p);
+    vec3 f = at(p + ivec2(1, 0));
+    vec3 h = at(p + ivec2(0, 1));
+    vec3 mn = min(min(min(d, e), min(f, b)), h);
+    vec3 mx = max(max(max(d, e), max(f, b)), h);
+    // Amount: high where there's headroom to the [0,1] range relative to the local maximum.
+    vec3 amp = sqrt(clamp(min(mn, 2.0 - mx) / max(mx, vec3(1e-5)), 0.0, 1.0));
+    float peak = -1.0 / mix(8.0, 5.0, clamp(pc.sharpness, 0.0, 1.0));
+    vec3 w = amp * peak;
+    vec3 c = (b * w + d * w + f * w + h * w + e) / (1.0 + 4.0 * w);
+    imageStore(dst, p, vec4(clamp(c, 0.0, 1.0), 1.0));
+}

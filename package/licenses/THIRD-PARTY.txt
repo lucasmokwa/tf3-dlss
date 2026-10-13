@@ -1,0 +1,48 @@
+TF3-DLSS - third-party components
+=================================
+
+TF3-DLSS itself (VkLayer_tf3_dlss.dll, its shaders and scripts) is MIT licensed:
+see TF3-DLSS-LICENSE.txt.
+
+This software contains source code provided by NVIDIA Corporation.
+
+
+NVIDIA DLSS (Deep Learning Super Sampling)
+------------------------------------------
+Files:    bin\nvngx_dlss.dll (the DLSS runtime, unmodified), and the NGX SDK
+          library linked into VkLayer_tf3_dlss.dll
+Source:   NVIDIA DLSS SDK, https://github.com/NVIDIA/DLSS
+License:  NVIDIA RTX SDKs license, see NVIDIA-DLSS-SDK-LICENSE.txt
+Note:     This mod uses the NVIDIA DLSS SDK. NVIDIA, RTX and DLSS are
+          trademarks of NVIDIA Corporation. TF3-DLSS is not made or endorsed
+          by NVIDIA.
+
+
+AMD FidelityFX Super Resolution 3.1 (FSR 3.1)
+---------------------------------------------
+Files:    bin\amd_fidelityfx_vk.dll (the signed FidelityFX API runtime from
+          the SDK's PrebuiltSignedDLL folder, unmodified), and the FidelityFX
+          API headers used to build VkLayer_tf3_dlss.dll
+Source:   AMD FidelityFX SDK v1.1.4,
+          https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK
+License:  MIT, Copyright (c) 2024 Advanced Micro Devices, Inc.
+          See AMD-FidelityFX-SDK-LICENSE.txt
+Note:     AMD, FidelityFX and FSR are trademarks of Advanced Micro Devices,
+          Inc. TF3-DLSS is not made or endorsed by AMD.
+
+The optional sharpening pass used with DLSS is contrast-adaptive sharpening
+written for this mod, modelled on the approach of AMD FidelityFX CAS.
+
+
+Vulkan headers
+--------------
+Files:    Khronos Vulkan headers, used to build VkLayer_tf3_dlss.dll
+Source:   https://github.com/KhronosGroup/Vulkan-Headers
+License:  Apache License 2.0 (or MIT), see Vulkan-Headers-Apache-2.0.txt
+
+
+Transport Fever 3
+-----------------
+Transport Fever 3 is made by Urban Games. TF3-DLSS is an unofficial mod and is
+not affiliated with or endorsed by Urban Games. It does not include or modify
+any of the game's files.
