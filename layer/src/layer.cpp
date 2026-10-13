@@ -693,6 +693,7 @@ std::unordered_map<VkFramebuffer, std::vector<VkImageView>> g_fbViews;
 std::unordered_map<VkRenderPass, RenderPassInfo> g_renderPasses;
 std::unordered_map<VkImage, VkImageLayout> g_layout;  // last layout recorded anywhere
 std::unordered_map<VkDescriptorSetLayout, std::vector<LayoutBinding>> g_setLayouts;
+std::unordered_set<VkDescriptorSetLayout> g_updateAfterBindLayouts;  // their sets need an update-after-bind pool
 std::unordered_map<VkDescriptorSet, VkDescriptorSetLayout> g_setLayoutOf;
 std::unordered_map<VkDescriptorSet, std::map<uint32_t, std::vector<DescItem>>> g_setContents;
 std::unordered_map<VkDescriptorUpdateTemplate, std::vector<TemplateEntry>> g_templates;
@@ -3200,6 +3201,9 @@ VkDescriptorSet BlitSet(DeviceData* d, VkDescriptorSet gameSet, uint32_t binding
         pi.maxSets = 16;
         pi.poolSizeCount = (uint32_t)(sizeof sizes / sizeof sizes[0]);
         pi.pPoolSizes = sizes;
+        // The game's blit layout may be update-after-bind; such sets must come from a pool with that flag
+        // (a pool with it also serves ordinary layouts).
+        if (g_updateAfterBindLayouts.count(lo->second)) pi.flags |= VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT;
         if (d->CreateDescriptorPool(d->device, &pi, nullptr, &g_dlss.pool) != VK_SUCCESS) return VK_NULL_HANDLE;
         VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
         si.magFilter = si.minFilter = VK_FILTER_LINEAR;
@@ -3614,7 +3618,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_CreateDevice(VkPhysicalDevice physical
     }
     VkDeviceCreateInfo ci = *pCreateInfo;
     // Add the device extensions NGX needs (only those the GPU supports).
-    bool addedBda = false;
+    bool addedBda = false, addedBdaExt = false;
     unsigned int ni = 0, nd = 0;
     const char** iexts = nullptr;
     const char** dexts = nullptr;
@@ -3628,6 +3632,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_CreateDevice(VkPhysicalDevice physical
             }
             exts.push_back(dexts[i]);
             if (!std::strcmp(dexts[i], VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME)) addedBda = true;
+            if (!std::strcmp(dexts[i], VK_EXT_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME)) addedBdaExt = true;
             Log("[device] + %s (for DLSS)", dexts[i]);
         }
     // buffer_device_address needs its feature switched on as well
@@ -3643,6 +3648,19 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_CreateDevice(VkPhysicalDevice physical
             bda.pNext = const_cast<void*>(ci.pNext);
             ci.pNext = &bda;
         }
+    }
+    // NGX asks for the EXT version on a Vulkan 1.1 game; it has its own feature structure (another sType),
+    // and NGX calls vkGetBufferDeviceAddressEXT, which needs the feature on (validation error otherwise).
+    VkPhysicalDeviceBufferDeviceAddressFeaturesEXT bdaExt{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES_EXT};
+    if (addedBdaExt && !addedBda &&
+        !FindInChain(pCreateInfo->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES_EXT) &&
+        !FindInChain(pCreateInfo->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES) &&
+        !FindInChain(pCreateInfo->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES)) {
+        bdaExt.bufferDeviceAddress = VK_TRUE;
+        bdaExt.pNext = const_cast<void*>(ci.pNext);
+        ci.pNext = &bdaExt;
+        Log("[device] bufferDeviceAddress feature switched on (for DLSS)");
     }
     FeaturePatch fp;
     size_t extsBeforeFsr = exts.size();
@@ -4439,6 +4457,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_CreateDescriptorSetLayout(VkDevice dev
         std::sort(b.begin(), b.end(), [](const LayoutBinding& x, const LayoutBinding& y) { return x.binding < y.binding; });
         std::lock_guard<std::recursive_mutex> lk(g_t);
         g_setLayouts[*pLayout] = std::move(b);
+        if (pInfo->flags & VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT)
+            g_updateAfterBindLayouts.insert(*pLayout);
     }
     return r;
 }
