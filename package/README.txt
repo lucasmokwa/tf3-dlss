@@ -17,16 +17,23 @@ REQUIREMENTS
 INSTALL
 -------
 1. Unzip the TF3-DLSS folder somewhere permanent, for example
-   Documents\TF3-DLSS. Not inside "Program Files" (the log can't be written
+   C:\Games\TF3-DLSS. Not inside "Program Files" (the log can't be written
    there).
 2. Double-click install.bat. It registers the mod for your Windows user; no
-   administrator rights, and no game files are touched.
-3. Start the game as usual. In the game's graphics options set
-   "Resolution scale" below 100% (50% = Performance, 67% = Quality).
-   At 100% the upscaler only smooths edges (DLAA / native AA).
+   administrator rights, and no game files are touched. If Windows asks
+   whether to run it, choose "Run".
+3. Start the game as usual and pick a "Resolution scale" in the game's
+   graphics options: 67% (Quality) or 50% (Performance) for more frames,
+   or 100% for native-resolution anti-aliasing (DLAA, no speed-up).
 
 If you move or rename the folder later, run uninstall.bat first and
 install.bat again from the new place.
+
+
+UPDATE
+------
+Close the game and replace this folder's contents with the new zip's. If
+you put the new version somewhere else, run install.bat again from there.
 
 
 USING IT
@@ -53,8 +60,8 @@ IF SOMETHING IS WRONG
 ---------------------
 - No change in game? Look for TF3-DLSS-DID-NOT-START.txt in this folder (or
   in %TEMP%). It says why the upscaler didn't run. Common reasons: install.bat
-  wasn't run, the game's Resolution scale is 100%, or DLSS isn't available on
-  the GPU (set upscaler=fsr).
+  wasn't run, the folder was moved after installing (run install.bat
+  again), or DLSS isn't available on the GPU (set upscaler=fsr).
 - tf3_dlss.log in this folder (or %TEMP%) has the details. Please attach it
   to any bug report, with your GPU and the render scale you use.
 - Smearing or ghosting behind moving things: people and animals currently get
