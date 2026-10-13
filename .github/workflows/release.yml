@@ -1,12 +1,16 @@
-# Builds the layer on every push to main and publishes a GitHub release when the version in
-# layer/src/layer.cpp (TF3_DLSS_VERSION) has no release yet. Pull requests get the same build and
-# package step, with the zip kept as a workflow artifact instead of a release.
-# To release: bump the version (see README, Releasing) and push to main.
+# Every push to main builds the layer and publishes a GitHub release:
+#   - TF3_DLSS_VERSION from layer/src/layer.cpp, if that version has no release yet and is newer
+#     than the latest release (a hand bump, e.g. to 1.0.0);
+#   - otherwise the next minor version after the latest release (0.2.0 -> 0.3.0).
+# The CI build stamps that version into its own copy of layer.cpp, the layer manifests and
+# package/README.txt; nothing is committed back. Pushes that only change Markdown files are skipped.
+# Pull requests get the same build, with the zip kept as a workflow artifact instead of a release.
 name: Build and release
 
 on:
   push:
     branches: [main]
+    paths-ignore: ['**.md']
   pull_request:
   workflow_dispatch:
 
@@ -23,7 +27,7 @@ env:
   DLSS_SDK_REF: v310.9.1
 
 jobs:
-  # Cheap Linux check first, so commits that don't change the version don't start a Windows build.
+  # Works out the version on a cheap Linux runner.
   version:
     runs-on: ubuntu-latest
     outputs:
@@ -35,23 +39,26 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          ver=$(sed -n 's/^#define TF3_DLSS_VERSION "\(.*\)"/\1/p' layer/src/layer.cpp)
-          [ -n "$ver" ] || { echo "TF3_DLSS_VERSION not found in layer/src/layer.cpp"; exit 1; }
-          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          src=$(sed -n 's/^#define TF3_DLSS_VERSION "\(.*\)"/\1/p' layer/src/layer.cpp)
+          [ -n "$src" ] || { echo "TF3_DLSS_VERSION not found in layer/src/layer.cpp"; exit 1; }
+          latest=$(gh api "repos/$GITHUB_REPOSITORY/releases" --paginate --jq '.[].tag_name' \
+                   | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sed 's/^v//' | sort -V | tail -1)
+          if [ -z "$latest" ] || [ "$(printf '%s\n%s\n' "$latest" "$src" | sort -V | tail -1)" != "$latest" ]; then
+            ver=$src
+          else
+            IFS=. read -r major minor _ <<< "$latest"
+            ver="$major.$((minor + 1)).0"
+          fi
           publish=false
           if [ "$GITHUB_EVENT_NAME" != pull_request ] && [ "$GITHUB_REF" = refs/heads/main ]; then
-            if gh release view "v$ver" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-              echo "Release v$ver already exists, nothing to publish."
-            else
-              publish=true
-            fi
+            publish=true
           fi
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
           echo "publish=$publish" >> "$GITHUB_OUTPUT"
-          echo "Version $ver, publish=$publish"
+          echo "layer.cpp $src, latest release ${latest:-none} -> version $ver, publish=$publish"
 
   build:
     needs: version
-    if: needs.version.outputs.publish == 'true' || github.event_name != 'push'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -84,6 +91,18 @@ jobs:
           Invoke-WebRequest "https://sdk.lunarg.com/sdk/download/$ver/windows/vulkan_sdk.exe" -OutFile $exe -UseBasicParsing
           $p = Start-Process $exe -ArgumentList '--root', "C:\VulkanSDK\$ver", '--accept-licenses', '--default-answer', '--confirm-command', 'install' -Wait -PassThru
           if ($p.ExitCode -ne 0) { throw "Vulkan SDK install failed (exit $($p.ExitCode))" }
+
+      - name: Stamp the version
+        shell: bash
+        env:
+          VER: ${{ needs.version.outputs.version }}
+        run: |
+          IFS=. read -r major minor patch <<< "$VER"
+          impl=$((major * 10000 + minor * 100 + patch))
+          sed -i "s/^#define TF3_DLSS_VERSION \".*\"/#define TF3_DLSS_VERSION \"$VER\"/" layer/src/layer.cpp
+          sed -i "s/\"implementation_version\": \"[0-9]*\"/\"implementation_version\": \"$impl\"/" layer/*.json
+          sed -i "1s/^TF3-DLSS [0-9.]*/TF3-DLSS $VER/" package/README.txt
+          git diff --stat
 
       - name: Build
         shell: pwsh

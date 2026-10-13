@@ -60,13 +60,15 @@ Vulkan loader uses one of them, so uninstall the release while developing.
 
 ## Releasing
 
-Releases are built and published by GitHub Actions (`.github/workflows/release.yml`):
+Every push to `main` is released by GitHub Actions (`.github/workflows/release.yml`), as the next
+minor version after the latest release (0.2.0, 0.3.0, ...). Pushes that only change Markdown files
+are skipped. The workflow stamps the version into its own copy of `layer.cpp`, the manifests and
+`package/README.txt`, runs `package.ps1` and publishes `TF3-DLSS-<version>.zip`; nothing is committed
+back and binaries are never committed.
 
-1. Bump `TF3_DLSS_VERSION` in `layer/src/layer.cpp`, the manifests' `implementation_version`, and the version in `package/README.txt`.
-2. Test locally (`.\build.ps1`, then in game), and make sure `tf3_dlss.cfg` has the developer options off.
-3. Push to `main`. If there's no release `v<version>` yet, the workflow builds, runs `package.ps1` and
-   publishes the release with `TF3-DLSS-<version>.zip` attached. Pushes that don't change the version
-   publish nothing. Binaries are never committed.
+For a bigger jump (say 1.0.0), set `TF3_DLSS_VERSION` in `layer/src/layer.cpp` to it: a version newer
+than the latest release is used as is. Before pushing, make sure `tf3_dlss.cfg` has the developer
+options off, or the package step fails.
 
 The CI build fetches the DLSS SDK from [NVIDIA/DLSS](https://github.com/NVIDIA/DLSS) at the tag in
 `DLSS_SDK_REF`, the Vulkan SDK from LunarG and the FSR runtime with `get_fsr.ps1`. Pull requests get the
