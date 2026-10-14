@@ -37,6 +37,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdarg>
 #include <cstddef>
@@ -50,12 +51,19 @@
 #include <fstream>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <string>
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+
+#ifdef _MSC_VER
+#include <intrin.h>  // __rdtsc (perf=1 timings)
+#else
+#include <x86intrin.h>
+#endif
 
 #ifdef _WIN32
 #include <windows.h>
@@ -279,6 +287,9 @@ struct Config {
     float debugObjectScale = 0.05f;  // same, for object motion (pixels written by the object pass)
     int cfgLive = 1;            // re-read this file while the game runs
     int logEvery = 600;         // detailed log every N frames (0 = only the first frames)
+    int perf = 0;               // 1 = measure what the layer costs (CPU and GPU), in the log and the info box
+    float perfSeconds = 5.f;    // perf=1: averaging window, seconds
+    int skipGameFsr = 0;        // don't draw the game's FSR 1 passes while DLSS/FSR 3.1 replaces their result
 } g_cfg;
 
 std::filesystem::path g_cfgPath;
@@ -364,16 +375,21 @@ bool LoadConfig() {
         else if (k == "debug_scale") c.debugScale = fv;
         else if (k == "debug_object_scale") c.debugObjectScale = fv;
         else if (k == "log_every") c.logEvery = iv;
+        else if (k == "perf") c.perf = iv;
+        else if (k == "perf_seconds") c.perfSeconds = std::min(std::max(fv, 1.f), 60.f);
+        else if (k == "skip_game_fsr") c.skipGameFsr = iv;
         else Log("[cfg] unknown setting '%s' ignored", k.c_str());
     }
     g_cfg = c;
     Log("[cfg] loaded %s: enabled=%d upscaler=%s preset=%d motion_vectors=%d object_motion=%d jitter=%d (phases %d, "
         "sign %g,%g, fsr sign %g,%g) sharpness=%g fsr_sharpness=%g mip_bias=%s%g fsr_color=%s fsr_debug=%d overlay=%d debug_keys=%d "
-        "dlss_dev=%d mv_scale=(%g,%g) reset_distance=%g mv_double=%d debug_view=%d cfg_live=%d log_every=%d",
+        "dlss_dev=%d mv_scale=(%g,%g) reset_distance=%g mv_double=%d debug_view=%d cfg_live=%d log_every=%d perf=%d "
+        "perf_seconds=%g skip_game_fsr=%d",
         g_cfgPath.string().c_str(), c.enabled, PrefName(c.upscaler), c.preset, c.motionVectors, c.objectMotion,
         c.jitter, c.jitterPhases, c.jitterSignX, c.jitterSignY, c.fsrJitterSignX, c.fsrJitterSignY, c.sharpness, c.fsrSharpness,
         c.mipBiasAuto ? "auto " : "", c.mipBias, c.fsrColorSrgb ? "srgb" : "linear", c.fsrDebug, c.overlay,
-        c.debugKeys, c.dlssDev, c.mvScaleX, c.mvScaleY, c.resetDistance, c.mvDouble, c.debugView, c.cfgLive, c.logEvery);
+        c.debugKeys, c.dlssDev, c.mvScaleX, c.mvScaleY, c.resetDistance, c.mvDouble, c.debugView, c.cfgLive, c.logEvery,
+        c.perf, c.perfSeconds, c.skipGameFsr);
     return true;
 }
 
@@ -470,7 +486,12 @@ struct InstanceData {
     X(DestroyFramebuffer)          \
     X(CmdCopyImage)                \
     X(ResetDescriptorPool)         \
-    X(DestroyImageView)
+    X(DestroyImageView)            \
+    X(CreateQueryPool)             \
+    X(DestroyQueryPool)            \
+    X(CmdResetQueryPool)           \
+    X(CmdWriteTimestamp)           \
+    X(GetQueryPoolResults)
 
 struct DeviceData {
     VkDevice device = VK_NULL_HANDLE;
@@ -492,10 +513,22 @@ InstanceData* GetInstance(void* key) {
     auto it = g_instances.find(key);
     return it == g_instances.end() ? nullptr : &it->second;
 }
+// Every hooked call looks its device up, so each thread remembers the last answer; g_deviceGen
+// (bumped when a device is created or destroyed) tells it when that answer may be stale.
+std::atomic<uint32_t> g_deviceGen{0};
 DeviceData* GetDevice(void* key) {
+    thread_local void* lastKey = nullptr;
+    thread_local DeviceData* last = nullptr;
+    thread_local uint32_t lastGen = UINT32_MAX;
+    uint32_t gen = g_deviceGen.load(std::memory_order_acquire);
+    if (key == lastKey && gen == lastGen) return last;
     std::lock_guard<std::mutex> lk(g_lock);
     auto it = g_devices.find(key);
-    return it == g_devices.end() ? nullptr : &it->second;
+    if (it == g_devices.end()) return nullptr;
+    lastKey = key;
+    last = &it->second;
+    lastGen = gen;
+    return last;
 }
 
 // =============================================================================================
@@ -566,8 +599,8 @@ struct Mapping {
 struct BoundSet {
     VkDescriptorSet set = VK_NULL_HANDLE;
     VkPipelineLayout layout = VK_NULL_HANDLE;
-    std::vector<uint32_t> dynOffsets;            // raw dynamic offsets for this set (for re-binding)
-    std::unordered_map<uint32_t, uint32_t> dyn;  // binding -> dynamic offset
+    std::vector<uint32_t> dynOffsets;                   // raw dynamic offsets for this set (for re-binding)
+    std::vector<std::pair<uint32_t, uint32_t>> dyn;     // binding -> dynamic offset (few; reused per bind)
 };
 
 // ---- Object probe (milestone 6, per-object motion vectors: feasibility check) ----------------
@@ -659,6 +692,9 @@ struct CmdState {
     std::vector<ObjDraw> objDraws;
     uint32_t objSlot = 0;
     bool objPending = false;
+    // the blit search (OnDraw) only runs again when a descriptor set was bound since the last one
+    uint32_t setsGen = 0, blitGen = UINT32_MAX;
+    std::pair<int, int> blitHit{-1, -1};
 };
 
 // Render state of a pipeline, for the scene draw log (Ctrl+Shift+L).
@@ -687,6 +723,62 @@ struct RenderPassInfo {
 // Guards everything below. Recursive: the FSR runtime may record through the loader (and so
 // through our own hooks) while we hold it inside RecordUpscale.
 std::recursive_mutex g_t;
+
+// ---------------------------------------------------------------------------------------------
+// Performance measurement (perf=1 in tf3_dlss.cfg), CPU side. Time spent in the layer's own code,
+// by kind of call, read with the CPU's time-stamp counter (a few nanoseconds per reading). The
+// driver's time isn't included: each scope ends before the call is passed on. Only the outermost
+// scope on a thread counts (DLSS records through our hooks while we record it). The GPU side and
+// the report are further down (GpuPerf, PerfPresent).
+// ---------------------------------------------------------------------------------------------
+enum PerfCat { kPerfDraw, kPerfBind, kPerfState, kPerfPass, kPerfDesc, kPerfUpscale, kPerfSubmit, kPerfPresent,
+               kPerfCreate, kPerfCount };
+const char* const kPerfNames[kPerfCount] = {"draws", "descriptor binds", "other commands", "render passes",
+                                            "descriptor updates", "upscaler recording", "submit", "present",
+                                            "shader/pipeline creation"};
+struct PerfCounters {
+    std::atomic<uint64_t> ticks[kPerfCount];
+    std::atomic<uint64_t> calls[kPerfCount];
+    std::atomic<uint64_t> lockWaits, lockWaitTicks;  // a thread had to wait for another one holding g_t
+} g_perf;  // zero-initialised (global)
+thread_local int t_perfDepth = 0;
+
+struct PerfScope {
+    PerfCat cat;
+    uint64_t t0 = 0;
+    bool active = false;
+    explicit PerfScope(PerfCat c) : cat(c) {
+        if (!g_cfg.perf) return;
+        active = true;
+        if (t_perfDepth++ == 0) t0 = __rdtsc();
+    }
+    ~PerfScope() {
+        if (!active) return;
+        --t_perfDepth;
+        if (!t0) return;
+        g_perf.ticks[cat].fetch_add(__rdtsc() - t0, std::memory_order_relaxed);
+        g_perf.calls[cat].fetch_add(1, std::memory_order_relaxed);
+    }
+    PerfScope(const PerfScope&) = delete;
+    PerfScope& operator=(const PerfScope&) = delete;
+};
+
+// Holds g_t. With perf=1 it also counts the times a thread had to wait for another one.
+struct TLock {
+    std::recursive_mutex& m;
+    explicit TLock(std::recursive_mutex& mu) : m(mu) {
+        if (m.try_lock()) return;
+        uint64_t t0 = g_cfg.perf ? __rdtsc() : 0;
+        m.lock();
+        if (t0) {
+            g_perf.lockWaits.fetch_add(1, std::memory_order_relaxed);
+            g_perf.lockWaitTicks.fetch_add(__rdtsc() - t0, std::memory_order_relaxed);
+        }
+    }
+    ~TLock() { m.unlock(); }
+    TLock(const TLock&) = delete;
+    TLock& operator=(const TLock&) = delete;
+};
 std::unordered_map<VkShaderModule, Kind> g_moduleKind;
 std::unordered_map<VkPipeline, Kind> g_pipelineKind;
 std::unordered_map<VkShaderModule, VsInfo> g_vsInfo;
@@ -707,7 +799,19 @@ std::unordered_map<VkDescriptorSet, std::map<uint32_t, std::vector<DescItem>>> g
 std::unordered_map<VkDescriptorUpdateTemplate, std::vector<TemplateEntry>> g_templates;
 std::unordered_map<VkBuffer, BufferInfo> g_buffers;
 std::unordered_map<VkDeviceMemory, Mapping> g_mapped;
-std::unordered_map<VkCommandBuffer, CmdState> g_cmd;
+std::unordered_map<VkCommandBuffer, CmdState> g_cmd;  // entries are never erased, so pointers to them stay valid
+
+// The state of a command buffer. A thread records into one command buffer at a time, so it keeps the
+// last one it looked up. Caller holds g_t.
+CmdState& CmdFor(VkCommandBuffer cb) {
+    thread_local VkCommandBuffer lastCb = VK_NULL_HANDLE;
+    thread_local CmdState* last = nullptr;
+    if (cb != lastCb || !last) {
+        last = &g_cmd[cb];
+        lastCb = cb;
+    }
+    return *last;
+}
 VkExtent2D g_swapExtent = {0, 0};
 uint32_t g_sceneRenderW = 0;  // width of the scene depth buffer = render width
 
@@ -862,8 +966,9 @@ void CheckForView(CmdState& cs) {
     const DescItem& d = b->second[0];
     if (!(d.type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER || d.type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC)) return;
     if (d.range != VK_WHOLE_SIZE && d.range < kViewSize) return;
-    auto dyn = bs.dyn.find(10);
-    VkDeviceSize off = d.offset + (dyn != bs.dyn.end() ? dyn->second : 0);
+    VkDeviceSize off = d.offset;
+    for (const auto& [binding, o] : bs.dyn)
+        if (binding == 10) off += o;
     cs.hasView = true;
     cs.viewBuf = d.buffer;
     cs.viewOff = off;
@@ -2377,12 +2482,10 @@ bool IsTriangles(VkPrimitiveTopology t) {
            t == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN;
 }
 
-// Record time, every scene draw: remember draws of meshes that have moved recently.
-void ObjRecordDraw(VkCommandBuffer cb, bool indexed, uint32_t count, uint32_t instanceCount, uint32_t first,
+// Record time, every scene draw: remember draws of meshes that have moved recently. Caller holds g_t.
+void ObjRecordDraw(CmdState& cs, bool indexed, uint32_t count, uint32_t instanceCount, uint32_t first,
                    int32_t vertexOffset, uint32_t firstInstance) {
     if (!g_cfg.objectMotion || !g_cfg.motionVectors || g_movingMeshes.empty()) return;
-    std::lock_guard<std::recursive_mutex> lk(g_t);
-    CmdState& cs = g_cmd[cb];
     if (!cs.fbIsScene || !instanceCount) return;
     auto pi = g_pipeVtx.find(cs.pipeline);
     if (pi == g_pipeVtx.end()) return;
@@ -2812,6 +2915,236 @@ void DestroyFsr(DeviceData* d) {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Performance measurement (perf=1), GPU side and the report
+// ---------------------------------------------------------------------------------------------
+// GPU timestamps around the work the layer adds to a frame (motion vectors, the upscaler, sharpening,
+// the rest), and from the game's FSR 1 passes (EASU + RCAS, whose image the upscaler replaces) to
+// the start of ours. A ring of kGpuSlots frames: a slot's results are read back, without waiting,
+// just before it is reused; the GPU finished that frame long before.
+constexpr uint32_t kGpuSlots = 8;
+enum GpuMarkId { kGmGameFsr, kGmStart, kGmMotion, kGmUpscaler, kGmSharpen, kGmEnd, kGmCount };
+constexpr uint32_t kGpuParts = kGmEnd - kGmStart;  // the intervals between kGmStart .. kGmEnd
+const char* const kGpuPartNames[kGpuParts] = {"motion vectors", "upscaler", "sharpening",
+                                              "info box, debug view, barriers"};
+struct GpuPerf {
+    VkQueryPool pool = VK_NULL_HANDLE;
+    bool failed = false;
+    double msPerTick = 0.0;
+    uint32_t slot = 0;
+    uint32_t written[kGpuSlots] = {};       // marks written into each slot since its reset, one bit per mark
+    uint64_t gameFsrFrame[kGpuSlots] = {};  // frame of the slot's kGmGameFsr mark ...
+    uint64_t startFrame[kGpuSlots] = {};    // ... and of its kGmStart mark: same frame = usable interval
+    // sums over the report window
+    double partMs[kGpuParts] = {}, totalMs = 0, gameFsrMs = 0;
+    uint64_t frames = 0, gameFsrFrames = 0;
+} g_gpu;
+
+// Creates the query pool on first use and resets all of it in this command buffer (which must be
+// outside a render pass). Caller holds g_t.
+bool GpuPerfEnsure(DeviceData* d, VkCommandBuffer cb) {
+    if (!g_cfg.perf || g_gpu.failed) return false;
+    if (g_gpu.pool) return true;
+    g_gpu.failed = true;  // cleared on success
+    VkPhysicalDeviceProperties props{};
+    if (d->instance && d->instance->GetPhysicalDeviceProperties)
+        d->instance->GetPhysicalDeviceProperties(d->physicalDevice, &props);
+    if (!props.limits.timestampComputeAndGraphics || props.limits.timestampPeriod <= 0.f) {
+        Log("[perf] this GPU can't time graphics work (no timestamps); no GPU timings");
+        return false;
+    }
+    VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+    qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
+    qi.queryCount = kGpuSlots * kGmCount;
+    if (d->CreateQueryPool(d->device, &qi, nullptr, &g_gpu.pool) != VK_SUCCESS) {
+        g_gpu.pool = VK_NULL_HANDLE;
+        Log("[perf] couldn't create the timestamp query pool; no GPU timings");
+        return false;
+    }
+    d->CmdResetQueryPool(cb, g_gpu.pool, 0, qi.queryCount);
+    g_gpu.msPerTick = props.limits.timestampPeriod * 1e-6;
+    g_gpu.slot = 0;
+    std::memset(g_gpu.written, 0, sizeof g_gpu.written);
+    g_gpu.failed = false;
+    Log("[perf] GPU timings ready (timestamp period %.3g ns)", props.limits.timestampPeriod);
+    return true;
+}
+
+// A timestamp into the current slot, once per slot. Caller holds g_t.
+void GpuMark(DeviceData* d, VkCommandBuffer cb, GpuMarkId m) {
+    if (!g_cfg.perf || !g_gpu.pool) return;
+    uint32_t bit = 1u << m;
+    if (g_gpu.written[g_gpu.slot] & bit) return;  // a query is written once between resets
+    d->CmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g_gpu.pool, g_gpu.slot * kGmCount + m);
+    g_gpu.written[g_gpu.slot] |= bit;
+    if (m == kGmGameFsr) g_gpu.gameFsrFrame[g_gpu.slot] = g_frame;
+    if (m == kGmStart) g_gpu.startFrame[g_gpu.slot] = g_frame;
+}
+
+// End of the layer's GPU work for a frame (outside a render pass): read the next slot back, add it to
+// the window, reset it and make it current. Caller holds g_t.
+void GpuFrameEnd(DeviceData* d, VkCommandBuffer cb) {
+    if (!g_cfg.perf || !g_gpu.pool) return;
+    uint32_t next = (g_gpu.slot + 1) % kGpuSlots;
+    uint32_t w = g_gpu.written[next];
+    if (w) {
+        uint64_t q[kGmCount][2] = {};  // value, availability
+        d->GetQueryPoolResults(d->device, g_gpu.pool, next * kGmCount, kGmCount, sizeof q, q, sizeof q[0],
+                               VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+        auto have = [&](int m) { return ((w >> m) & 1u) && q[m][1]; };
+        auto ms = [&](int a, int b) { return (double)(int64_t)(q[b][0] - q[a][0]) * g_gpu.msPerTick; };
+        bool all = true;
+        for (int m = kGmStart; m <= kGmEnd; ++m) all = all && have(m);
+        double total = all ? ms(kGmStart, kGmEnd) : -1.0;
+        if (total >= 0.0 && total < 1000.0) {
+            for (uint32_t i = 0; i < kGpuParts; ++i) g_gpu.partMs[i] += ms(kGmStart + i, kGmStart + i + 1);
+            g_gpu.totalMs += total;
+            ++g_gpu.frames;
+            double game = have(kGmGameFsr) && g_gpu.gameFsrFrame[next] == g_gpu.startFrame[next]
+                              ? ms(kGmGameFsr, kGmStart) : -1.0;
+            if (game >= 0.0 && game < 1000.0) {
+                g_gpu.gameFsrMs += game;
+                ++g_gpu.gameFsrFrames;
+            }
+        }
+    }
+    d->CmdResetQueryPool(cb, g_gpu.pool, next * kGmCount, kGmCount);
+    g_gpu.written[next] = 0;
+    g_gpu.slot = next;
+}
+
+void DestroyGpuPerf(DeviceData* d) {
+    if (g_gpu.pool) d->DestroyQueryPool(d->device, g_gpu.pool, nullptr);
+    g_gpu = GpuPerf{};
+}
+
+// The report window: frame times (present to present) and the counters above, logged every
+// perf_seconds and summed up in the info box.
+struct PerfWindow {
+    bool running = false;
+    double startMs = 0, lastMs = 0;
+    uint64_t startTsc = 0;
+    std::vector<float> frameMs;
+    double scopeTicks = 0;     // what one PerfScope costs, roughly (PerfScopeTicks)
+    std::string overlayLine;   // for the info box
+} g_pw;
+
+// Rough cost of one measurement (two counter readings and two atomic adds), so the report can say
+// how much the measuring itself adds.
+double PerfScopeTicks() {
+    std::atomic<uint64_t> a{0}, b{0};
+    const int n = 4096;
+    uint64_t t0 = __rdtsc();
+    for (int i = 0; i < n; ++i) {
+        uint64_t t = __rdtsc();
+        a.fetch_add(__rdtsc() - t, std::memory_order_relaxed);
+        b.fetch_add(1, std::memory_order_relaxed);
+    }
+    return (double)(__rdtsc() - t0) / n;
+}
+
+void PerfReset() {
+    for (int c = 0; c < kPerfCount; ++c) {
+        g_perf.ticks[c].store(0, std::memory_order_relaxed);
+        g_perf.calls[c].store(0, std::memory_order_relaxed);
+    }
+    g_perf.lockWaits.store(0, std::memory_order_relaxed);
+    g_perf.lockWaitTicks.store(0, std::memory_order_relaxed);
+    for (double& m : g_gpu.partMs) m = 0.0;
+    g_gpu.totalMs = g_gpu.gameFsrMs = 0.0;
+    g_gpu.frames = g_gpu.gameFsrFrames = 0;
+}
+
+// Once per presented frame. Caller holds g_t.
+void PerfPresent() {
+    if (!g_cfg.perf) {
+        if (g_pw.running) Log("[perf] measuring stopped");
+        g_pw = PerfWindow{};
+        return;
+    }
+    double now = NowMs();
+    uint64_t tsc = __rdtsc();
+    if (!g_pw.running) {
+        PerfReset();
+        g_pw = PerfWindow{};
+        g_pw.running = true;
+        g_pw.startMs = g_pw.lastMs = now;
+        g_pw.startTsc = tsc;
+        g_pw.scopeTicks = PerfScopeTicks();
+        g_pw.overlayLine = "PERF: MEASURING...";
+        Log("[perf] measuring the layer's cost: a report every %g s (perf_seconds)", g_cfg.perfSeconds);
+        return;
+    }
+    g_pw.frameMs.push_back((float)(now - g_pw.lastMs));
+    g_pw.lastMs = now;
+    double winMs = now - g_pw.startMs;
+    if (winMs < g_cfg.perfSeconds * 1000.0 || g_pw.frameMs.empty() || tsc <= g_pw.startTsc) return;
+
+    double tpm = (double)(tsc - g_pw.startTsc) / winMs;  // counter ticks per millisecond
+    double n = (double)g_pw.frameMs.size();
+    std::vector<float> sorted = g_pw.frameMs;
+    std::sort(sorted.begin(), sorted.end());
+    float p99 = sorted[(size_t)(0.99 * (double)(sorted.size() - 1))];
+    double avg = winMs / n;
+    bool running = g_dlss.enabled && g_lastDlssFrame != UINT64_MAX && g_lastDlssFrame + 1 >= g_frame;
+    char up[96];
+    if (!running) std::snprintf(up, sizeof up, "upscaler not running (the game's FSR 1)");
+    else if (g_dlss.backend == Backend::Dlss && g_cfg.preset > 0)
+        std::snprintf(up, sizeof up, "DLSS preset %c %ux%u -> %ux%u", 'A' + g_cfg.preset - 1, g_dlss.inW, g_dlss.inH,
+                      g_dlss.outW, g_dlss.outH);
+    else std::snprintf(up, sizeof up, "%s %ux%u -> %ux%u", BackendName(g_dlss.backend), g_dlss.inW, g_dlss.inH,
+                       g_dlss.outW, g_dlss.outH);
+    Log("[perf] %.1f s, %.0f frames: %.2f ms per frame (%.1f fps), slowest 1%%: %.2f ms | %s | skip_game_fsr=%d",
+        winMs / 1000.0, n, avg, 1000.0 / avg, p99, up, g_cfg.skipGameFsr);
+
+    double cpuMs = 0.0, scopes = 0.0;
+    std::string parts;
+    for (int c = 0; c < kPerfCount; ++c) {
+        uint64_t t = g_perf.ticks[c].load(std::memory_order_relaxed), k = g_perf.calls[c].load(std::memory_order_relaxed);
+        if (!k) continue;
+        double ms = (double)t / tpm / n;
+        cpuMs += ms;
+        scopes += (double)k;
+        char b[96];
+        std::snprintf(b, sizeof b, "%s%s %.3f (%.0f calls)", parts.empty() ? "" : ", ", kPerfNames[c], ms, (double)k / n);
+        parts += b;
+    }
+    Log("[perf]   layer CPU: %.3f ms per frame (%.1f%% of the frame): %s", cpuMs, 100.0 * cpuMs / avg,
+        parts.empty() ? "nothing measured" : parts.c_str());
+    uint64_t waits = g_perf.lockWaits.load(std::memory_order_relaxed);
+    Log("[perf]   measuring itself adds about %.3f ms per frame; game threads waited for the layer's lock %.0f times "
+        "per frame, %.3f ms in all",
+        g_pw.scopeTicks * scopes / tpm / n, (double)waits / n,
+        (double)g_perf.lockWaitTicks.load(std::memory_order_relaxed) / tpm / n);
+    double gpuMs = g_gpu.frames ? g_gpu.totalMs / (double)g_gpu.frames : 0.0;
+    double upMs = g_gpu.frames ? g_gpu.partMs[1] / (double)g_gpu.frames : 0.0;
+    if (g_gpu.frames) {
+        std::string gp;
+        for (uint32_t i = 0; i < kGpuParts; ++i) {
+            char b[96];
+            std::snprintf(b, sizeof b, "%s%s %.3f", i ? ", " : "", kGpuPartNames[i], g_gpu.partMs[i] / (double)g_gpu.frames);
+            gp += b;
+        }
+        char game[96] = "not measured";
+        if (g_gpu.gameFsrFrames)
+            std::snprintf(game, sizeof game, "%.3f ms", g_gpu.gameFsrMs / (double)g_gpu.gameFsrFrames);
+        Log("[perf]   GPU: the layer's passes %.3f ms per frame (%s); the game's FSR 1 passes before them %s",
+            gpuMs, gp.c_str(), game);
+    } else
+        Log("[perf]   GPU: %s", g_gpu.failed ? "no timings on this GPU" : "nothing measured (no upscaler ran)");
+    char ov[96];
+    if (g_gpu.frames)
+        std::snprintf(ov, sizeof ov, "LAYER CPU %.2f MS  GPU %.2f MS  %s %.2f", cpuMs, gpuMs,
+                      g_dlss.backend == Backend::Fsr ? "FSR" : "DLSS", upMs);
+    else std::snprintf(ov, sizeof ov, "LAYER CPU %.2f MS  GPU -", cpuMs);
+    g_pw.overlayLine = ov;
+
+    PerfReset();
+    g_pw.startMs = now;
+    g_pw.startTsc = tsc;
+    g_pw.frameMs.clear();
+}
+
+// ---------------------------------------------------------------------------------------------
 // On-screen info box (overlay=1, or Ctrl+Shift+O with debug_keys=1)
 // ---------------------------------------------------------------------------------------------
 // A few lines of text drawn into the upscaled image by overlay.comp, so settings can be compared
@@ -2819,7 +3152,7 @@ void DestroyFsr(DeviceData* d) {
 const uint32_t kOvSpirv[] = {
 #include "overlay.spv.inc"
 };
-constexpr uint32_t kOvLines = 6, kOvCols = 44;
+constexpr uint32_t kOvLines = 7, kOvCols = 44;    // at most; the 7th line is perf=1's
 constexpr uint32_t kOvFontWords = 128;           // 64 glyphs (ASCII 32..95) x 2 words
 constexpr uint32_t kOvSlotWords = 128;           // text of one frame: kOvLines x kOvCols bytes, rounded up
 constexpr uint32_t kOvSlots = 8;                 // frames in flight never reach this
@@ -2974,7 +3307,8 @@ std::vector<std::string> OverlayLines(Backend backend, const CmdState& cs, uint3
                                        : "CAMERA ONLY             [M]");
     std::snprintf(b[5], sizeof b[5], "FPS %.0f (%.1f MS)  [U]SWITCH [D]OFF [O]HIDE", g_fps,
                   g_fps > 0.f ? 1000.f / g_fps : 0.f);
-    return std::vector<std::string>(std::begin(b), std::end(b));
+    std::snprintf(b[6], sizeof b[6], "%s", g_pw.overlayLine.c_str());
+    return std::vector<std::string>(std::begin(b), std::begin(b) + (g_cfg.perf ? 7 : 6));
 }
 
 // Draws the info box into outImage (in GENERAL, after the upscaler and sharpening).
@@ -2986,7 +3320,8 @@ void RecordOverlay(DeviceData* d, VkCommandBuffer cb, Backend backend, const Cmd
     char* text = g_dlss.ovPtr + base * 4;
     std::memset(text, ' ', kOvSlotWords * 4);
     std::vector<std::string> lines = OverlayLines(backend, cs, inW, inH);
-    for (uint32_t l = 0; l < kOvLines && l < lines.size(); ++l)
+    uint32_t nLines = (uint32_t)std::min<size_t>(lines.size(), kOvLines);
+    for (uint32_t l = 0; l < nLines; ++l)
         for (uint32_t c = 0; c < kOvCols && c < lines[l].size(); ++c)
             text[l * kOvCols + c] = (char)std::toupper((unsigned char)lines[l][c]);
     VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
@@ -2999,13 +3334,13 @@ void RecordOverlay(DeviceData* d, VkCommandBuffer cb, Backend backend, const Cmd
     d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr,
                           0, nullptr, 1, &b);
     int32_t scale = std::max<int32_t>(1, (int32_t)g_dlss.outH / 720);  // 3 at 4K, 2 at 1440p
-    uint32_t w = (kOvCols * 6 + 3) * scale, h = (kOvLines * 9 + 3) * scale;
+    uint32_t w = (kOvCols * 6 + 3) * scale, h = (nLines * 9 + 3) * scale;
     // overlay_x / overlay_y: position in percent of the screen, kept fully on screen
     int32_t x = (int32_t)std::lround(g_cfg.overlayX / 100.0 * g_dlss.outW);
     int32_t y = (int32_t)std::lround(g_cfg.overlayY / 100.0 * g_dlss.outH);
     x = std::max(0, std::min(x, (int32_t)g_dlss.outW - (int32_t)w));
     y = std::max(0, std::min(y, (int32_t)g_dlss.outH - (int32_t)h));
-    OvPush pc{{x, y}, {(int32_t)g_dlss.outW, (int32_t)g_dlss.outH}, scale, (int32_t)kOvLines, (int32_t)kOvCols,
+    OvPush pc{{x, y}, {(int32_t)g_dlss.outW, (int32_t)g_dlss.outH}, scale, (int32_t)nLines, (int32_t)kOvCols,
               (int32_t)base};
     d->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_dlss.ovPipeline);
     d->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_dlss.ovPipeLayout, 0, 1, &g_dlss.ovSet, 0, nullptr);
@@ -3121,6 +3456,7 @@ void RecordUpscale(DeviceData* d, VkCommandBuffer cb, CmdState& cs) {
     VkImageAspectFlags depthAspects =
         VK_IMAGE_ASPECT_DEPTH_BIT | (HasStencil(di.fmt) ? VK_IMAGE_ASPECT_STENCIL_BIT : 0);
     const VkImageLayout RO = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    if (GpuPerfEnsure(d, cb)) GpuMark(d, cb, kGmStart);  // perf=1: GPU timings
 
     // inputs -> read-only, output -> general
     if (colorLayout != RO) Barrier(d, cb, cs.colorImage, VK_IMAGE_ASPECT_COLOR_BIT, colorLayout, RO);
@@ -3173,6 +3509,7 @@ void RecordUpscale(DeviceData* d, VkCommandBuffer cb, CmdState& cs) {
     } else if (backend == Backend::Fsr) {  // FSR needs the depth copy from the motion pass
         if (depthLayout != RO) Barrier(d, cb, cs.depthImage, depthAspects, RO, depthLayout);
         if (colorLayout != RO) Barrier(d, cb, cs.colorImage, VK_IMAGE_ASPECT_COLOR_BIT, RO, colorLayout);
+        GpuFrameEnd(d, cb);
         RestoreGameState(d, cb, cs);
         return;
     } else if (g_dlss.mvLayout != RO) {  // no motion pass: zero motion vectors
@@ -3183,6 +3520,7 @@ void RecordUpscale(DeviceData* d, VkCommandBuffer cb, CmdState& cs) {
         Barrier(d, cb, g_dlss.mvImage, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, RO);
         g_dlss.mvLayout = RO;
     }
+    GpuMark(d, cb, kGmMotion);
     Barrier(d, cb, g_dlss.outImage, VK_IMAGE_ASPECT_COLOR_BIT, g_dlss.outLayout, VK_IMAGE_LAYOUT_GENERAL);
 
     if (g_cfg.jitter) {
@@ -3220,6 +3558,7 @@ void RecordUpscale(DeviceData* d, VkCommandBuffer cb, CmdState& cs) {
     } else {
         ok = RecordFsr(cb, cs, ci);
     }
+    GpuMark(d, cb, kGmUpscaler);
 
     if (g_cap.outPending && g_cap.out && ok) {  // recording: the upscaler's output itself
         Barrier(d, cb, g_dlss.outImage, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL,
@@ -3233,6 +3572,7 @@ void RecordUpscale(DeviceData* d, VkCommandBuffer cb, CmdState& cs) {
     }
     g_cap.outPending = false;
     if (ok && backend == Backend::Dlss) RecordSharpen(d, cb);  // FSR sharpens itself (RCAS)
+    GpuMark(d, cb, kGmSharpen);
     if (g_cfg.debugView && ok && (g_cfg.debugView == 2 || cs.mvPending)) RecordDebugView(d, cb, cs);
     if (ok) RecordOverlay(d, cb, backend, cs, ci.w, ci.h);
 
@@ -3241,6 +3581,8 @@ void RecordUpscale(DeviceData* d, VkCommandBuffer cb, CmdState& cs) {
     g_dlss.outLayout = RO;
     if (depthLayout != RO) Barrier(d, cb, cs.depthImage, depthAspects, RO, depthLayout);
     if (colorLayout != RO) Barrier(d, cb, cs.colorImage, VK_IMAGE_ASPECT_COLOR_BIT, RO, colorLayout);
+    GpuMark(d, cb, kGmEnd);
+    GpuFrameEnd(d, cb);
     RestoreGameState(d, cb, cs);
 
     if (!ok) {
@@ -3344,9 +3686,8 @@ struct SwapPlan {
     std::vector<uint32_t> dyn;  // dynamic offsets for the replacement set
 };
 
-SwapPlan OnDraw(DeviceData* d, VkCommandBuffer cb) {
-    std::lock_guard<std::recursive_mutex> lk(g_t);
-    CmdState& cs = g_cmd[cb];
+// Caller holds g_t.
+SwapPlan OnDraw(DeviceData* d, CmdState& cs) {
     SwapPlan plan;
     if (cs.kind == Kind::FsrEasu && !g_firstFsrFrame) {
         g_firstFsrFrame = g_frame + 1;
@@ -3378,6 +3719,7 @@ SwapPlan OnDraw(DeviceData* d, VkCommandBuffer cb) {
             auto imgs = FbImages(cs.fb);
             if (!imgs.empty()) cs.rcasOut = imgs[0];
             cs.rcasInThisPass = true;
+            cs.blitGen = UINT32_MAX;
             return plan;
         }
         default: break;
@@ -3385,7 +3727,12 @@ SwapPlan OnDraw(DeviceData* d, VkCommandBuffer cb) {
 
     // The blit: first draw after RCAS that samples RCAS's output.
     if (!cs.rcasOut) return plan;
-    auto [si, binding] = FindSampled(cs, cs.rcasOut);
+    // Every draw after RCAS (the whole UI) gets here; search the bound sets again only if they changed.
+    if (cs.blitGen != cs.setsGen) {
+        cs.blitHit = FindSampled(cs, cs.rcasOut);
+        cs.blitGen = cs.setsGen;
+    }
+    auto [si, binding] = cs.blitHit;
     if (si < 0) return plan;
     if (LogFrame(g_frame) && g_lastBlitLogFrame != g_frame) {
         g_lastBlitLogFrame = g_frame;
@@ -3774,6 +4121,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_CreateDevice(VkPhysicalDevice physical
     {
         std::lock_guard<std::mutex> lk(g_lock);
         d = &g_devices[Key(*pDevice)];
+        g_deviceGen.fetch_add(1, std::memory_order_release);
     }
     d->device = *pDevice;
     d->physicalDevice = physicalDevice;
@@ -3784,7 +4132,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_CreateDevice(VkPhysicalDevice physical
     DEVICE_CALLS(X)
 #undef X
     {
-        std::lock_guard<std::recursive_mutex> lk(g_t);
+        TLock lk(g_t);
         if (!g_dlss.dev) {
             g_dlss.dev = d;
             const char* off = std::getenv("TF3_DLSS_OFF");
@@ -3811,10 +4159,11 @@ static VKAPI_ATTR void VKAPI_CALL tf3_DestroyDevice(VkDevice device, const VkAll
     if (!d) return;
     PFN_vkDestroyDevice fn = d->DestroyDevice;
     {
-        std::lock_guard<std::recursive_mutex> lk(g_t);
+        TLock lk(g_t);
         if (g_dlss.dev == d) {
             d->DeviceWaitIdle(device);
             DestroyFsr(d);
+            DestroyGpuPerf(d);
             if (g_dlss.handle) NVSDK_NGX_VULKAN_ReleaseFeature(g_dlss.handle);
             if (g_dlss.params) NVSDK_NGX_VULKAN_DestroyParameters(g_dlss.params);
             if (g_dlss.ngxInited) NVSDK_NGX_VULKAN_Shutdown1(device);
@@ -3827,6 +4176,7 @@ static VKAPI_ATTR void VKAPI_CALL tf3_DestroyDevice(VkDevice device, const VkAll
     {
         std::lock_guard<std::mutex> lk(g_lock);
         g_devices.erase(Key(device));
+        g_deviceGen.fetch_add(1, std::memory_order_release);
     }
     fn(device, pAllocator);
 }
@@ -4076,18 +4426,19 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_CreateShaderModule(VkDevice device, co
                                                              VkShaderModule* pModule) {
     VkResult r = GetDevice(Key(device))->CreateShaderModule(device, pInfo, pAllocator, pModule);
     if (r == VK_SUCCESS) {
+        PerfScope ps(kPerfCreate);
         VsInfo vi = ParseVertexShader(pInfo->pCode, pInfo->codeSize / 4);
         if (!vi.tag.empty()) {
-            std::lock_guard<std::recursive_mutex> lk(g_t);
+            TLock lk(g_t);
             g_moduleTag[*pModule] = vi.tag;
         }
         std::string res = ShaderResourceNames(pInfo->pCode, pInfo->codeSize / 4);
         if (!res.empty()) {
-            std::lock_guard<std::recursive_mutex> lk(g_t);
+            TLock lk(g_t);
             g_moduleRes[*pModule] = res;
         }
         if (vi.mdlLoc >= 0 || vi.skinned) {
-            std::lock_guard<std::recursive_mutex> lk(g_t);
+            TLock lk(g_t);
             g_vsInfo[*pModule] = vi;
             static int logged = 0;
             if (logged++ < 4)
@@ -4096,7 +4447,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_CreateShaderModule(VkDevice device, co
         }
         Kind k = Classify(pInfo->pCode, pInfo->codeSize);
         if (k != Kind::Other) {
-            std::lock_guard<std::recursive_mutex> lk(g_t);
+            TLock lk(g_t);
             g_moduleKind[*pModule] = k;
             Log("[shader] module %s = %s", H(*pModule).c_str(), KindName(k));
         }
@@ -4107,7 +4458,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_CreateShaderModule(VkDevice device, co
 static VKAPI_ATTR void VKAPI_CALL tf3_DestroyShaderModule(VkDevice device, VkShaderModule module,
                                                           const VkAllocationCallbacks* pAllocator) {
     {
-        std::lock_guard<std::recursive_mutex> lk(g_t);
+        TLock lk(g_t);
         g_moduleKind.erase(module);
     }
     GetDevice(Key(device))->DestroyShaderModule(device, module, pAllocator);
@@ -4118,6 +4469,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_CreateGraphicsPipelines(VkDevice devic
                                                                   const VkAllocationCallbacks* pAllocator,
                                                                   VkPipeline* pPipelines) {
     // Viewport jitter needs the viewport to be dynamic state; make it so where the game baked it in.
+    std::optional<PerfScope> ps(std::in_place, kPerfCreate);
     std::vector<VkGraphicsPipelineCreateInfo> infos(pInfos, pInfos + count);
     std::vector<VkPipelineDynamicStateCreateInfo> dyn(count);
     std::vector<std::vector<VkDynamicState>> dynList(count);
@@ -4135,7 +4487,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_CreateGraphicsPipelines(VkDevice devic
              ci.pDepthStencilState->back.passOp != VK_STENCIL_OP_KEEP)) {
             std::string tag;
             {
-                std::lock_guard<std::recursive_mutex> lk(g_t);
+                TLock lk(g_t);
                 for (uint32_t k = 0; k < ci.stageCount; ++k)
                     if (ci.pStages[k].stage == VK_SHADER_STAGE_VERTEX_BIT) {
                         auto t = g_moduleTag.find(ci.pStages[k].module);
@@ -4171,9 +4523,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_CreateGraphicsPipelines(VkDevice devic
             pvp[i].staticVp = ci.pViewportState->pViewports[0];
         }
     }
+    ps.reset();  // the driver's time isn't ours
     VkResult r = GetDevice(Key(device))->CreateGraphicsPipelines(device, cache, count, infos.data(), pAllocator, pPipelines);
     if (r != VK_SUCCESS) return r;
-    std::lock_guard<std::recursive_mutex> lk(g_t);
+    ps.emplace(kPerfCreate);
+    TLock lk(g_t);
     for (uint32_t i = 0; i < count; ++i)
         if (pPipelines[i]) g_pipeVp[pPipelines[i]] = pvp[i];
     for (uint32_t i = 0; i < count; ++i) {
@@ -4326,7 +4680,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_CreateGraphicsPipelines(VkDevice devic
 static VKAPI_ATTR void VKAPI_CALL tf3_DestroyPipeline(VkDevice device, VkPipeline pipeline,
                                                      const VkAllocationCallbacks* pAllocator) {
     {
-        std::lock_guard<std::recursive_mutex> lk(g_t);
+        TLock lk(g_t);
         g_pipelineKind.erase(pipeline);
         g_pipeVtx.erase(pipeline);
         g_pipeVp.erase(pipeline);
@@ -4348,7 +4702,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_CreateSampler(VkDevice device, const V
     VkSamplerCreateInfo info = *pInfo;
     float bias = 0.f;
     {
-        std::lock_guard<std::recursive_mutex> lk(g_t);
+        TLock lk(g_t);
         // Only with an upscaler: the game's own FSR 1 doesn't recover the detail, it would just shimmer.
         if (!UpscalerExpected()) bias = 0.f;
         else if (g_cfg.mipBiasAuto) {
@@ -4394,7 +4748,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_CreateImage(VkDevice device, const VkI
         r = d->CreateImage(device, &info, pAllocator, pImage);
     }
     if (r == VK_SUCCESS && info.imageType == VK_IMAGE_TYPE_2D) {
-        std::lock_guard<std::recursive_mutex> lk(g_t);
+        TLock lk(g_t);
         if (IsDepthFormat(info.format) && info.extent.width >= 1000 && info.extent.width != info.extent.height)
             g_sceneRenderW = info.extent.width;  // the game's render width (for the texture LOD bias)
         g_images[*pImage] = ImageInfo{info.extent.width, info.extent.height, info.format, info.usage};
@@ -4411,7 +4765,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_CreateImage(VkDevice device, const VkI
 static VKAPI_ATTR void VKAPI_CALL tf3_DestroyImage(VkDevice device, VkImage image, const VkAllocationCallbacks* pAllocator) {
     DeviceData* d = GetDevice(Key(device));
     {
-        std::lock_guard<std::recursive_mutex> lk(g_t);
+        TLock lk(g_t);
         auto ii = g_images.find(image);
         bool renderTarget = ii != g_images.end() && ii->second.w >= 1000 && ii->second.w != ii->second.h;
         auto dv = g_dlss.depthViews.find(image);
@@ -4434,7 +4788,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_CreateImageView(VkDevice device, const
                                                           const VkAllocationCallbacks* pAllocator, VkImageView* pView) {
     VkResult r = GetDevice(Key(device))->CreateImageView(device, pInfo, pAllocator, pView);
     if (r == VK_SUCCESS) {
-        std::lock_guard<std::recursive_mutex> lk(g_t);
+        TLock lk(g_t);
         g_viewImage[*pView] = pInfo->image;
     }
     return r;
@@ -4445,7 +4799,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_CreateFramebuffer(VkDevice device, con
                                                             VkFramebuffer* pFb) {
     VkResult r = GetDevice(Key(device))->CreateFramebuffer(device, pInfo, pAllocator, pFb);
     if (r == VK_SUCCESS) {
-        std::lock_guard<std::recursive_mutex> lk(g_t);
+        TLock lk(g_t);
         g_fbViews[*pFb].assign(pInfo->pAttachments, pInfo->pAttachments + pInfo->attachmentCount);
     }
     return r;
@@ -4475,7 +4829,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_CreateRenderPass(VkDevice device, cons
     VkResult r = GetDevice(Key(device))->CreateRenderPass(device, &info, pAllocator, pRp);
     if (changed && r == VK_SUCCESS) Log("[renderpass] %s: depth storeOp forced to STORE", H(*pRp).c_str());
     if (r == VK_SUCCESS) {
-        std::lock_guard<std::recursive_mutex> lk(g_t);
+        TLock lk(g_t);
         auto& rp = g_renderPasses[*pRp];
         rp.finalLayouts.clear();
         for (uint32_t i = 0; i < pInfo->attachmentCount; ++i) rp.finalLayouts.push_back(pInfo->pAttachments[i].finalLayout);
@@ -4483,7 +4837,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_CreateRenderPass(VkDevice device, cons
     return r;
 }
 static void RecordRp2(const VkRenderPassCreateInfo2* pInfo, VkRenderPass rpH) {
-    std::lock_guard<std::recursive_mutex> lk(g_t);
+    TLock lk(g_t);
     auto& rp = g_renderPasses[rpH];
     rp.finalLayouts.clear();
     for (uint32_t i = 0; i < pInfo->attachmentCount; ++i) rp.finalLayouts.push_back(pInfo->pAttachments[i].finalLayout);
@@ -4517,7 +4871,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_CreateSwapchainKHR(VkDevice device, co
                                                              VkSwapchainKHR* pSwapchain) {
     VkResult r = GetDevice(Key(device))->CreateSwapchainKHR(device, pInfo, pAllocator, pSwapchain);
     if (r == VK_SUCCESS) {
-        std::lock_guard<std::recursive_mutex> lk(g_t);
+        TLock lk(g_t);
         g_swapExtent = pInfo->imageExtent;
         Log("[swapchain] %ux%u format %d", pInfo->imageExtent.width, pInfo->imageExtent.height, (int)pInfo->imageFormat);
     }
@@ -4531,13 +4885,13 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_BindBufferMemory(VkDevice device, VkBu
                                                            VkDeviceSize offset) {
     VkResult r = GetDevice(Key(device))->BindBufferMemory(device, buffer, memory, offset);
     if (r == VK_SUCCESS) {
-        std::lock_guard<std::recursive_mutex> lk(g_t);
+        TLock lk(g_t);
         g_buffers[buffer] = BufferInfo{memory, offset};
     }
     return r;
 }
 static void RecordBinds2(uint32_t count, const VkBindBufferMemoryInfo* p) {
-    std::lock_guard<std::recursive_mutex> lk(g_t);
+    TLock lk(g_t);
     for (uint32_t i = 0; i < count; ++i) g_buffers[p[i].buffer] = BufferInfo{p[i].memory, p[i].memoryOffset};
 }
 static VKAPI_ATTR VkResult VKAPI_CALL tf3_BindBufferMemory2(VkDevice device, uint32_t count,
@@ -4556,14 +4910,14 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_MapMemory(VkDevice device, VkDeviceMem
                                                     VkDeviceSize size, VkMemoryMapFlags flags, void** ppData) {
     VkResult r = GetDevice(Key(device))->MapMemory(device, memory, offset, size, flags, ppData);
     if (r == VK_SUCCESS) {
-        std::lock_guard<std::recursive_mutex> lk(g_t);
+        TLock lk(g_t);
         g_mapped[memory] = Mapping{static_cast<char*>(*ppData), offset, size};
     }
     return r;
 }
 static VKAPI_ATTR void VKAPI_CALL tf3_UnmapMemory(VkDevice device, VkDeviceMemory memory) {
     {
-        std::lock_guard<std::recursive_mutex> lk(g_t);
+        TLock lk(g_t);
         g_mapped.erase(memory);
     }
     GetDevice(Key(device))->UnmapMemory(device, memory);
@@ -4583,7 +4937,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_CreateDescriptorSetLayout(VkDevice dev
             b.push_back({pInfo->pBindings[i].binding, pInfo->pBindings[i].descriptorType,
                          pInfo->pBindings[i].descriptorCount});
         std::sort(b.begin(), b.end(), [](const LayoutBinding& x, const LayoutBinding& y) { return x.binding < y.binding; });
-        std::lock_guard<std::recursive_mutex> lk(g_t);
+        TLock lk(g_t);
         g_setLayouts[*pLayout] = std::move(b);
         if (pInfo->flags & VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT)
             g_updateAfterBindLayouts.insert(*pLayout);
@@ -4596,7 +4950,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_AllocateDescriptorSets(VkDevice device
                                                                  VkDescriptorSet* pSets) {
     VkResult r = GetDevice(Key(device))->AllocateDescriptorSets(device, pInfo, pSets);
     if (r == VK_SUCCESS) {
-        std::lock_guard<std::recursive_mutex> lk(g_t);
+        PerfScope ps(kPerfDesc);
+        TLock lk(g_t);
         for (uint32_t i = 0; i < pInfo->descriptorSetCount; ++i) {
             g_setLayoutOf[pSets[i]] = pInfo->pSetLayouts[i];
             g_setContents.erase(pSets[i]);
@@ -4609,7 +4964,8 @@ static VKAPI_ATTR void VKAPI_CALL tf3_UpdateDescriptorSets(VkDevice device, uint
                                                            const VkWriteDescriptorSet* pWrites, uint32_t copyCount,
                                                            const VkCopyDescriptorSet* pCopies) {
     {
-        std::lock_guard<std::recursive_mutex> lk(g_t);
+        PerfScope ps(kPerfDesc);
+        TLock lk(g_t);
         for (uint32_t i = 0; i < writeCount; ++i) {
             const auto& w = pWrites[i];
             for (uint32_t e = 0; e < w.descriptorCount; ++e) {
@@ -4643,7 +4999,7 @@ static void RecordTemplate(const VkDescriptorUpdateTemplateCreateInfo* pInfo, Vk
         const auto& e = pInfo->pDescriptorUpdateEntries[i];
         v.push_back({e.dstBinding, e.dstArrayElement, e.descriptorCount, e.descriptorType, e.offset, e.stride});
     }
-    std::lock_guard<std::recursive_mutex> lk(g_t);
+    TLock lk(g_t);
     g_templates[t] = std::move(v);
 }
 static VKAPI_ATTR VkResult VKAPI_CALL tf3_CreateDescriptorUpdateTemplate(
@@ -4661,7 +5017,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_CreateDescriptorUpdateTemplateKHR(
     return r;
 }
 static void ApplyTemplate(VkDescriptorSet set, VkDescriptorUpdateTemplate t, const void* pData) {
-    std::lock_guard<std::recursive_mutex> lk(g_t);
+    PerfScope ps(kPerfDesc);
+    TLock lk(g_t);
     auto it = g_templates.find(t);
     if (it == g_templates.end()) return;
     const char* base = static_cast<const char*>(pData);
@@ -4697,16 +5054,18 @@ static VKAPI_ATTR void VKAPI_CALL tf3_UpdateDescriptorSetWithTemplateKHR(VkDevic
 // =============================================================================================
 static VKAPI_ATTR VkResult VKAPI_CALL tf3_BeginCommandBuffer(VkCommandBuffer cb, const VkCommandBufferBeginInfo* pInfo) {
     {
-        std::lock_guard<std::recursive_mutex> lk(g_t);
-        g_cmd[cb] = CmdState{};
+        PerfScope ps(kPerfState);
+        TLock lk(g_t);
+        CmdFor(cb) = CmdState{};
     }
     return GetDevice(Key(cb))->BeginCommandBuffer(cb, pInfo);
 }
 
 static VKAPI_ATTR void VKAPI_CALL tf3_CmdBindPipeline(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipeline pipeline) {
     if (bp == VK_PIPELINE_BIND_POINT_GRAPHICS) {
-        std::lock_guard<std::recursive_mutex> lk(g_t);
-        auto& cs = g_cmd[cb];
+        PerfScope ps(kPerfState);
+        TLock lk(g_t);
+        auto& cs = CmdFor(cb);
         auto it = g_pipelineKind.find(pipeline);
         cs.kind = it == g_pipelineKind.end() ? Kind::Other : it->second;
         cs.pipeline = pipeline;
@@ -4721,14 +5080,19 @@ static VKAPI_ATTR void VKAPI_CALL tf3_CmdBindDescriptorSets(VkCommandBuffer cb, 
                                                             const VkDescriptorSet* sets, uint32_t dynCount,
                                                             const uint32_t* dynOffsets) {
     if (bp == VK_PIPELINE_BIND_POINT_GRAPHICS) {
-        std::lock_guard<std::recursive_mutex> lk(g_t);
-        auto& cs = g_cmd[cb];
+        PerfScope ps(kPerfBind);
+        TLock lk(g_t);
+        auto& cs = CmdFor(cb);
         if (cs.sets.size() < firstSet + count) cs.sets.resize(firstSet + count);
+        ++cs.setsGen;
         uint32_t di = 0;  // dynamic offsets are consumed in set order, then binding order
         for (uint32_t i = 0; i < count; ++i) {
-            BoundSet bs;
+            BoundSet& bs = cs.sets[firstSet + i];  // filled in place: keeps the vectors' memory
             bs.set = sets[i];
             bs.layout = layout;
+            bs.dyn.clear();
+            bs.dynOffsets.clear();
+            if (di >= dynCount) continue;  // no dynamic offsets left (most binds have none)
             auto lo = g_setLayoutOf.find(sets[i]);
             if (lo != g_setLayoutOf.end()) {
                 auto lb = g_setLayouts.find(lo->second);
@@ -4737,11 +5101,10 @@ static VKAPI_ATTR void VKAPI_CALL tf3_CmdBindDescriptorSets(VkCommandBuffer cb, 
                         if (IsDynamic(b.type))
                             for (uint32_t k = 0; k < b.count; ++k, ++di)
                                 if (di < dynCount) {
-                                    if (k == 0) bs.dyn[b.binding] = dynOffsets[di];
+                                    if (k == 0) bs.dyn.push_back({b.binding, dynOffsets[di]});
                                     bs.dynOffsets.push_back(dynOffsets[di]);
                                 }
             }
-            cs.sets[firstSet + i] = std::move(bs);
         }
     }
     GetDevice(Key(cb))->CmdBindDescriptorSets(cb, bp, layout, firstSet, count, sets, dynCount, dynOffsets);
@@ -4753,16 +5116,18 @@ static VKAPI_ATTR void VKAPI_CALL tf3_CmdPipelineBarrier(VkCommandBuffer cb, VkP
                                                          uint32_t bufCount, const VkBufferMemoryBarrier* buf,
                                                          uint32_t imgCount, const VkImageMemoryBarrier* img) {
     if (imgCount) {
-        std::lock_guard<std::recursive_mutex> lk(g_t);
-        auto& cs = g_cmd[cb];
+        PerfScope ps(kPerfState);
+        TLock lk(g_t);
+        auto& cs = CmdFor(cb);
         for (uint32_t i = 0; i < imgCount; ++i) SetLayout(cs, img[i].image, img[i].newLayout);
     }
     GetDevice(Key(cb))->CmdPipelineBarrier(cb, src, dst, dep, memCount, mem, bufCount, buf, imgCount, img);
 }
 
 static void BeginRp(VkCommandBuffer cb, const VkRenderPassBeginInfo* p) {
-    std::lock_guard<std::recursive_mutex> lk(g_t);
-    auto& cs = g_cmd[cb];
+    PerfScope ps(kPerfPass);
+    TLock lk(g_t);
+    auto& cs = CmdFor(cb);
     cs.fb = p->framebuffer;
     cs.rp = p->renderPass;
     cs.rcasInThisPass = false;
@@ -4797,16 +5162,20 @@ static VKAPI_ATTR void VKAPI_CALL tf3_CmdBeginRenderPass2KHR(VkCommandBuffer cb,
 
 // After a render pass ends: apply its final layouts, and if it was RCAS's pass, run DLSS.
 static void AfterEndRp(DeviceData* d, VkCommandBuffer cb) {
-    std::lock_guard<std::recursive_mutex> lk(g_t);
-    auto& cs = g_cmd[cb];
-    auto rp = g_renderPasses.find(cs.rp);
-    if (rp != g_renderPasses.end()) {
-        auto imgs = FbImages(cs.fb);
-        for (size_t i = 0; i < imgs.size() && i < rp->second.finalLayouts.size(); ++i)
-            if (imgs[i]) SetLayout(cs, imgs[i], rp->second.finalLayouts[i]);
+    TLock lk(g_t);
+    auto& cs = CmdFor(cb);
+    {
+        PerfScope ps(kPerfPass);
+        auto rp = g_renderPasses.find(cs.rp);
+        if (rp != g_renderPasses.end()) {
+            auto imgs = FbImages(cs.fb);
+            for (size_t i = 0; i < imgs.size() && i < rp->second.finalLayouts.size(); ++i)
+                if (imgs[i]) SetLayout(cs, imgs[i], rp->second.finalLayouts[i]);
+        }
     }
     if (cs.rcasInThisPass) {
         cs.rcasInThisPass = false;
+        PerfScope ps(kPerfUpscale);
         RecordUpscale(d, cb, cs);
     }
 }
@@ -4832,8 +5201,9 @@ static void SwapBind(DeviceData* d, VkCommandBuffer cb, const SwapPlan& plan) {
                              (uint32_t)plan.dyn.size(), plan.dyn.data());
 }
 static void SwapRestore(DeviceData* d, VkCommandBuffer cb, const SwapPlan& plan) {
-    std::lock_guard<std::recursive_mutex> lk(g_t);
-    auto& cs = g_cmd[cb];
+    PerfScope ps(kPerfDraw);
+    TLock lk(g_t);
+    auto& cs = CmdFor(cb);
     if (plan.index < cs.sets.size()) {
         const BoundSet& bs = cs.sets[plan.index];
         d->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, bs.layout, plan.index, 1, &bs.set,
@@ -4845,9 +5215,8 @@ static void SwapRestore(DeviceData* d, VkCommandBuffer cb, const SwapPlan& plan)
 // Jitter by shifting the viewport of draws into the scene framebuffer by the sub-pixel offset.
 // Only what DLSS upscales is jittered; the camera data stays untouched, so passes that aren't
 // upscaled (the selection mask behind the hover outline, terrain tile caches, ...) are unaffected.
-void ApplyViewport(DeviceData* d, VkCommandBuffer cb) {
-    std::lock_guard<std::recursive_mutex> lk(g_t);
-    CmdState& cs = g_cmd[cb];
+// Caller holds g_t.
+void ApplyViewport(DeviceData* d, VkCommandBuffer cb, CmdState& cs) {
     auto pi = g_pipeVp.find(cs.pipeline);
     if (pi == g_pipeVp.end() || !pi->second.dynamic) return;
     VkViewport want;
@@ -4879,8 +5248,9 @@ void ApplyViewport(DeviceData* d, VkCommandBuffer cb) {
 static VKAPI_ATTR void VKAPI_CALL tf3_CmdSetViewport(VkCommandBuffer cb, uint32_t first, uint32_t count,
                                                      const VkViewport* pViewports) {
     {
-        std::lock_guard<std::recursive_mutex> lk(g_t);
-        CmdState& cs = g_cmd[cb];
+        PerfScope ps(kPerfState);
+        TLock lk(g_t);
+        CmdState& cs = CmdFor(cb);
         if (first == 0 && count >= 1) {
             cs.gameVp = cs.curVp = pViewports[0];
             cs.hasGameVp = cs.hasCurVp = true;
@@ -4892,8 +5262,9 @@ static VKAPI_ATTR void VKAPI_CALL tf3_CmdSetViewport(VkCommandBuffer cb, uint32_
 static VKAPI_ATTR void VKAPI_CALL tf3_CmdSetScissor(VkCommandBuffer cb, uint32_t first, uint32_t count,
                                                     const VkRect2D* pScissors) {
     {
-        std::lock_guard<std::recursive_mutex> lk(g_t);
-        CmdState& cs = g_cmd[cb];
+        PerfScope ps(kPerfState);
+        TLock lk(g_t);
+        CmdState& cs = CmdFor(cb);
         if (first == 0 && count >= 1) {
             cs.scissor = pScissors[0];
             cs.hasScissor = true;
@@ -4911,10 +5282,10 @@ struct DrawLog {
     VkFramebuffer lastFb = VK_NULL_HANDLE;
 } g_drawLog;
 
-void LogSceneDraw(VkCommandBuffer cb, bool indexed, uint32_t count, uint32_t instances, uint32_t firstInstance) {
+// Caller holds g_t.
+void LogSceneDraw(VkCommandBuffer cb, CmdState& cs, bool indexed, uint32_t count, uint32_t instances,
+                  uint32_t firstInstance) {
     if (g_drawLog.frame != g_frame) return;
-    std::lock_guard<std::recursive_mutex> lk(g_t);
-    CmdState& cs = g_cmd[cb];
     if (cs.fb != g_drawLog.lastFb || cs.rp != g_drawLog.lastRp) {
         g_drawLog.lastFb = cs.fb;
         g_drawLog.lastRp = cs.rp;
@@ -4962,11 +5333,10 @@ struct ProbeFrameData {
 };
 ProbeFrameData g_probeCur, g_probePrev;
 
-void ProbeDraw(VkCommandBuffer cb, bool indexed, uint32_t count, uint32_t instanceCount, uint32_t first,
+// Caller holds g_t.
+void ProbeDraw(CmdState& cs, bool indexed, uint32_t count, uint32_t instanceCount, uint32_t first,
                int32_t vertexOffset, uint32_t firstInstance) {
     if (!ProbeFrame(g_frame)) return;
-    std::lock_guard<std::recursive_mutex> lk(g_t);
-    CmdState& cs = g_cmd[cb];
     if (!cs.fbIsScene) return;
     auto pi = g_pipeVtx.find(cs.pipeline);
     if (pi == g_pipeVtx.end()) return;
@@ -5066,8 +5436,9 @@ static VKAPI_ATTR void VKAPI_CALL tf3_CmdBindVertexBuffers(VkCommandBuffer cb, u
                                                            uint32_t bindingCount, const VkBuffer* pBuffers,
                                                            const VkDeviceSize* pOffsets) {
     {
-        std::lock_guard<std::recursive_mutex> lk(g_t);
-        CmdState& cs = g_cmd[cb];
+        PerfScope ps(kPerfState);
+        TLock lk(g_t);
+        CmdState& cs = CmdFor(cb);
         for (uint32_t i = 0; i < bindingCount; ++i)
             if (firstBinding + i < 16) cs.vb[firstBinding + i] = {pBuffers[i], pOffsets[i]};
     }
@@ -5077,8 +5448,9 @@ static VKAPI_ATTR void VKAPI_CALL tf3_CmdBindVertexBuffers(VkCommandBuffer cb, u
 static VKAPI_ATTR void VKAPI_CALL tf3_CmdBindIndexBuffer(VkCommandBuffer cb, VkBuffer buffer, VkDeviceSize offset,
                                                          VkIndexType type) {
     {
-        std::lock_guard<std::recursive_mutex> lk(g_t);
-        CmdState& cs = g_cmd[cb];
+        PerfScope ps(kPerfState);
+        TLock lk(g_t);
+        CmdState& cs = CmdFor(cb);
         cs.ib = buffer;
         cs.ibOff = offset;
         cs.ibType = type;
@@ -5086,14 +5458,35 @@ static VKAPI_ATTR void VKAPI_CALL tf3_CmdBindIndexBuffer(VkCommandBuffer cb, VkB
     GetDevice(Key(cb))->CmdBindIndexBuffer(cb, buffer, offset, type);
 }
 
+// skip_game_fsr=1: the game's FSR 1 passes (EASU, RCAS) draw an image that nobody sees while DLSS or
+// FSR 3.1 runs (the blit shows ours instead), so their draws can be left out. Only while the upscaler
+// ran last frame; if it then fails, the screen shows a stale image for that frame. Caller holds g_t.
+bool SkipGameFsrDraw(const CmdState& cs) {
+    return g_cfg.skipGameFsr && (cs.kind == Kind::FsrEasu || cs.kind == Kind::FsrRcas) && g_dlss.enabled &&
+           g_lastDlssFrame != UINT64_MAX && g_lastDlssFrame + 1 >= g_frame;
+}
+
+// Everything the layer does before a game draw, under one lock. Fills `plan` with the descriptor set
+// to swap in for this draw (the blit), and returns false if the draw is to be left out.
+bool BeforeDraw(DeviceData* d, VkCommandBuffer cb, bool indexed, uint32_t count, uint32_t instances, uint32_t first,
+                int32_t vertexOffset, uint32_t firstInstance, SwapPlan& plan) {
+    PerfScope ps(kPerfDraw);
+    TLock lk(g_t);
+    CmdState& cs = CmdFor(cb);
+    LogSceneDraw(cb, cs, indexed, count, instances, firstInstance);
+    ProbeDraw(cs, indexed, count, instances, first, vertexOffset, firstInstance);
+    ObjRecordDraw(cs, indexed, count, instances, first, vertexOffset, firstInstance);
+    ApplyViewport(d, cb, cs);
+    plan = OnDraw(d, cs);
+    if (cs.kind == Kind::FsrEasu) GpuMark(d, cb, kGmGameFsr);
+    return !SkipGameFsrDraw(cs);
+}
+
 static VKAPI_ATTR void VKAPI_CALL tf3_CmdDraw(VkCommandBuffer cb, uint32_t vertexCount, uint32_t instanceCount,
                                               uint32_t firstVertex, uint32_t firstInstance) {
     DeviceData* d = GetDevice(Key(cb));
-    LogSceneDraw(cb, false, vertexCount, instanceCount, firstInstance);
-    ProbeDraw(cb, false, vertexCount, instanceCount, firstVertex, 0, firstInstance);
-    ObjRecordDraw(cb, false, vertexCount, instanceCount, firstVertex, 0, firstInstance);
-    ApplyViewport(d, cb);
-    SwapPlan plan = OnDraw(d, cb);
+    SwapPlan plan;
+    if (!BeforeDraw(d, cb, false, vertexCount, instanceCount, firstVertex, 0, firstInstance, plan)) return;
     if (plan.set) SwapBind(d, cb, plan);
     d->CmdDraw(cb, vertexCount, instanceCount, firstVertex, firstInstance);
     if (plan.set) SwapRestore(d, cb, plan);
@@ -5102,11 +5495,8 @@ static VKAPI_ATTR void VKAPI_CALL tf3_CmdDraw(VkCommandBuffer cb, uint32_t verte
 static VKAPI_ATTR void VKAPI_CALL tf3_CmdDrawIndexed(VkCommandBuffer cb, uint32_t indexCount, uint32_t instanceCount,
                                                      uint32_t firstIndex, int32_t vertexOffset, uint32_t firstInstance) {
     DeviceData* d = GetDevice(Key(cb));
-    LogSceneDraw(cb, true, indexCount, instanceCount, firstInstance);
-    ProbeDraw(cb, true, indexCount, instanceCount, firstIndex, vertexOffset, firstInstance);
-    ObjRecordDraw(cb, true, indexCount, instanceCount, firstIndex, vertexOffset, firstInstance);
-    ApplyViewport(d, cb);
-    SwapPlan plan = OnDraw(d, cb);
+    SwapPlan plan;
+    if (!BeforeDraw(d, cb, true, indexCount, instanceCount, firstIndex, vertexOffset, firstInstance, plan)) return;
     if (plan.set) SwapBind(d, cb, plan);
     d->CmdDrawIndexed(cb, indexCount, instanceCount, firstIndex, vertexOffset, firstInstance);
     if (plan.set) SwapRestore(d, cb, plan);
@@ -5118,7 +5508,8 @@ static VKAPI_ATTR void VKAPI_CALL tf3_CmdDrawIndexed(VkCommandBuffer cb, uint32_
 static VKAPI_ATTR VkResult VKAPI_CALL tf3_QueueSubmit(VkQueue queue, uint32_t submitCount, const VkSubmitInfo* pSubmits,
                                                       VkFence fence) {
     {
-        std::lock_guard<std::recursive_mutex> lk(g_t);
+        PerfScope ps(kPerfSubmit);
+        TLock lk(g_t);
         for (uint32_t s = 0; s < submitCount; ++s)
             for (uint32_t c = 0; c < pSubmits[s].commandBufferCount; ++c) {
                 auto it = g_cmd.find(pSubmits[s].pCommandBuffers[c]);
@@ -5146,12 +5537,12 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_QueueSubmit(VkQueue queue, uint32_t su
     VkResult r = d->QueueSubmit(queue, submitCount, pSubmits, fence);
     std::vector<CaptureFrame> toWrite;
     {
-        std::lock_guard<std::recursive_mutex> lk(g_t);
+        TLock lk(g_t);
         toWrite.swap(g_cap.pending);
     }
     if (!toWrite.empty() && r == VK_SUCCESS) {
         d->QueueWaitIdle(queue);  // recording frames only: wait so the copies are complete
-        std::lock_guard<std::recursive_mutex> lk(g_t);
+        TLock lk(g_t);
         for (const auto& f : toWrite) WriteCapture(f);
     }
     return r;
@@ -5159,7 +5550,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_QueueSubmit(VkQueue queue, uint32_t su
 
 static VKAPI_ATTR VkResult VKAPI_CALL tf3_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pInfo) {
     {
-        std::lock_guard<std::recursive_mutex> lk(g_t);
+        PerfScope ps(kPerfPresent);
+        TLock lk(g_t);
 #ifdef _WIN32
         // Hotkeys, only while the game window has focus and only with debug_keys=1 in tf3_dlss.cfg (players
         // choose with the cfg, so a stray key press can't switch the upscaler off):
@@ -5313,6 +5705,10 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_QueuePresentKHR(VkQueue queue, const V
                 g_lastDlssFrame == g_frame ? "ran" : "did not run", g_lastSwapFrame == g_frame ? "yes" : "no");
         }
         ++g_frame;
+    }
+    {
+        TLock lk(g_t);
+        PerfPresent();  // perf=1: frame times, and the report every perf_seconds
     }
     return GetDevice(Key(queue))->QueuePresentKHR(queue, pInfo);
 }
