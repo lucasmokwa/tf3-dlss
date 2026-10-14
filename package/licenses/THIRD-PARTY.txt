@@ -1,8 +1,11 @@
 TF3-DLSS - third-party components
 =================================
 
-TF3-DLSS itself (VkLayer_tf3_dlss.dll, its shaders and scripts) is MIT licensed:
-see TF3-DLSS-LICENSE.txt.
+TF3-DLSS's own source code (the layer, version.dll, shaders and scripts) is MIT
+licensed: see TF3-DLSS-LICENSE.txt. The MIT license does not cover the NVIDIA
+parts: bin\VkLayer_tf3_dlss.dll has NVIDIA's NGX SDK library linked into it,
+and bin\nvngx_dlss.dll is NVIDIA's DLSS runtime. Those stay under NVIDIA's
+terms (NVIDIA-DLSS-SDK-LICENSE.txt and the terms of use below).
 
 This software contains source code provided by NVIDIA Corporation.
 
@@ -39,6 +42,16 @@ Vulkan headers
 Files:    Khronos Vulkan headers, used to build VkLayer_tf3_dlss.dll
 Source:   https://github.com/KhronosGroup/Vulkan-Headers
 License:  Apache License 2.0 (or MIT), see Vulkan-Headers-Apache-2.0.txt
+
+
+Terms of use for the NVIDIA components
+--------------------------------------
+bin\nvngx_dlss.dll and the NVIDIA code in bin\VkLayer_tf3_dlss.dll belong to
+NVIDIA Corporation and its licensors. You may use them only together with
+TF3-DLSS. You may not redistribute them separately from TF3-DLSS, sell, rent
+or sublicense them, modify them, reverse engineer, decompile or disassemble
+them, or remove their copyright or other proprietary notices. They are
+provided "as is", without warranty of any kind.
 
 
 Transport Fever 3
