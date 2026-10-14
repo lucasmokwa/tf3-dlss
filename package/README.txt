@@ -55,7 +55,7 @@ Other useful settings:
   sharpness=0.3       DLSS sharpening, 0 (off) to 1
   fsr_sharpness=0.5   FSR sharpening, 0 (off) to 1
   preset=11       DLSS model (K); 13 (M) can look better at 50% on RTX 40/50
-  mip_bias=auto   sharper ground textures; set -1 if fine patterns shimmer
+  mip_bias=auto   sharper textures; -2 is sharper still, but fences shimmer
 
 
 IF SOMETHING IS WRONG
