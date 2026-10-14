@@ -263,7 +263,7 @@ struct Config {
     int objectMotion = 1;       // motion vectors for moving objects (vehicles), not just the camera
     int objectDepthTest = 1;    // debug: 0 = draw object motion even where the object is hidden
     int fixHighlightDepth = 1;  // keep the hover highlight's overlay from writing depth (needs a restart)
-    bool mipBiasAuto = true;    // texture LOD bias: NVIDIA's log2(render/display) - 1 (needs a restart)
+    bool mipBiasAuto = true;    // texture LOD bias: log2(render/display), -1 at 50% (needs a restart)
     float mipBias = 0.f;        // used when mipBiasAuto is false (0 = off)
     float sharpness = 0.f;      // sharpening after DLSS, 0..1 (0 = off)
     float fsrSharpness = 0.5f;  // FSR's own sharpening (RCAS), 0..1 (0 = off)
@@ -4269,7 +4269,8 @@ static VKAPI_ATTR void VKAPI_CALL tf3_DestroyPipeline(VkDevice device, VkPipelin
 // Texture LOD bias
 // =============================================================================================
 // DLSS renders at a lower resolution, so the GPU picks blurrier mip levels than the 4K output
-// needs. NVIDIA: bias = log2(render width / display width) - 1 (-2 at 50%). Applied to the game's
+// needs. "auto" uses log2(render width / display width) (-1 at 50%): NVIDIA's recommendation has an
+// extra -1, but in TF3 that made cut-out textures (fences) shimmer under jitter. Applied to the game's
 // material samplers when they are created: mipmapped, filtering, repeating texture coordinates
 // (UI, shadow and post-processing samplers clamp or don't use mips, and are left alone).
 static VKAPI_ATTR VkResult VKAPI_CALL tf3_CreateSampler(VkDevice device, const VkSamplerCreateInfo* pInfo,
@@ -4282,7 +4283,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_CreateSampler(VkDevice device, const V
         if (!UpscalerExpected()) bias = 0.f;
         else if (g_cfg.mipBiasAuto) {
             if (g_sceneRenderW && g_swapExtent.width && g_sceneRenderW < g_swapExtent.width)
-                bias = std::log2((float)g_sceneRenderW / (float)g_swapExtent.width) - 1.f;
+                bias = std::log2((float)g_sceneRenderW / (float)g_swapExtent.width);
         } else bias = g_cfg.mipBias;
         auto repeats = [](VkSamplerAddressMode m) {
             return m == VK_SAMPLER_ADDRESS_MODE_REPEAT || m == VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
