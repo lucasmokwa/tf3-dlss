@@ -256,6 +256,7 @@ struct Config {
     float mvScaleX = 1.f;       // debug: multiply motion vectors (use -1 to flip an axis)
     float mvScaleY = 1.f;
     float resetDistance = 1000; // camera jump (world units per frame) that resets DLSS history
+    int mvDouble = 1;           // camera motion: 1 = one reprojection matrix built in double, 0 = float (old)
     int jitter = 1;             // sub-pixel camera jitter (needed for DLSS to resolve detail)
     int jitterPhases = 0;       // 0 = NVIDIA's recommendation for the current scale
     int jitterScreenPasses = 0; // debug: 1 = also jitter full-screen passes (reflections, AO, bloom), as before 0.2
@@ -340,6 +341,7 @@ bool LoadConfig() {
         else if (k == "mv_scale_x") c.mvScaleX = fv;
         else if (k == "mv_scale_y") c.mvScaleY = fv;
         else if (k == "reset_distance") c.resetDistance = fv;
+        else if (k == "mv_double") c.mvDouble = iv;
         else if (k == "cfg_live") c.cfgLive = iv;
         else if (k == "debug_view") c.debugView = iv;
         else if (k == "jitter") c.jitter = iv;
@@ -367,11 +369,11 @@ bool LoadConfig() {
     g_cfg = c;
     Log("[cfg] loaded %s: enabled=%d upscaler=%s preset=%d motion_vectors=%d object_motion=%d jitter=%d (phases %d, "
         "sign %g,%g, fsr sign %g,%g) sharpness=%g fsr_sharpness=%g mip_bias=%s%g fsr_color=%s fsr_debug=%d overlay=%d debug_keys=%d "
-        "dlss_dev=%d mv_scale=(%g,%g) reset_distance=%g debug_view=%d cfg_live=%d log_every=%d",
+        "dlss_dev=%d mv_scale=(%g,%g) reset_distance=%g mv_double=%d debug_view=%d cfg_live=%d log_every=%d",
         g_cfgPath.string().c_str(), c.enabled, PrefName(c.upscaler), c.preset, c.motionVectors, c.objectMotion,
         c.jitter, c.jitterPhases, c.jitterSignX, c.jitterSignY, c.fsrJitterSignX, c.fsrJitterSignY, c.sharpness, c.fsrSharpness,
         c.mipBiasAuto ? "auto " : "", c.mipBias, c.fsrColorSrgb ? "srgb" : "linear", c.fsrDebug, c.overlay,
-        c.debugKeys, c.dlssDev, c.mvScaleX, c.mvScaleY, c.resetDistance, c.debugView, c.cfgLive, c.logEvery);
+        c.debugKeys, c.dlssDev, c.mvScaleX, c.mvScaleY, c.resetDistance, c.mvDouble, c.debugView, c.cfgLive, c.logEvery);
     return true;
 }
 
@@ -1088,9 +1090,10 @@ const uint32_t kMvSpirv[] = {
 constexpr uint32_t kMvSlots = 16;
 constexpr uint32_t kMvStride = 256;   // max minUniformBufferOffsetAlignment allowed by the spec
 struct MvUbo {
-    float curInvViewProj[16];  // jittered (matches the depth buffer)
+    float curInvViewProj[16];  // jittered (matches the depth buffer); with sizeAndScale[3] = 1 it is the
+                               // whole reprojection (current clip -> previous clip, see UploadMvMatrices)
     float prevViewProj[16];    // unjittered
-    float sizeAndScale[4];
+    float sizeAndScale[4];     // xy = render size, z = 1 for motion, w = 1 if curInvViewProj is the reprojection
     float jitterPx[4];         // this frame's jitter in render pixels (xy)
     // object motion pass (object_mv.vert/.frag)
     float curViewProj[16];     // unjittered (jitter comes from the viewport)
@@ -1661,6 +1664,63 @@ void JitterInverse(float* m, float dx, float dy) {
     for (int r = 0; r < 4; ++r) m[12 + r] -= dx * m[0 + r] + dy * m[4 + r];
 }
 
+// Column-major 4x4 helpers in double, for the camera reprojection.
+void MulD(const double* a, const double* b, double* o) {
+    for (int c = 0; c < 4; ++c)
+        for (int r = 0; r < 4; ++r) {
+            double t = 0;
+            for (int k = 0; k < 4; ++k) t += a[k * 4 + r] * b[c * 4 + k];
+            o[c * 4 + r] = t;
+        }
+}
+
+// Gauss-Jordan with partial pivoting. False if m is singular.
+bool InvertD(const double* m, double* inv) {
+    double a[4][8];
+    for (int r = 0; r < 4; ++r)
+        for (int c = 0; c < 4; ++c) {
+            a[r][c] = m[c * 4 + r];
+            a[r][4 + c] = r == c ? 1.0 : 0.0;
+        }
+    for (int c = 0; c < 4; ++c) {
+        int piv = c;
+        for (int r = c + 1; r < 4; ++r)
+            if (std::fabs(a[r][c]) > std::fabs(a[piv][c])) piv = r;
+        if (std::fabs(a[piv][c]) < 1e-300) return false;
+        if (piv != c)
+            for (int k = 0; k < 8; ++k) std::swap(a[c][k], a[piv][k]);
+        double d = a[c][c];
+        for (int k = 0; k < 8; ++k) a[c][k] /= d;
+        for (int r = 0; r < 4; ++r) {
+            if (r == c || a[r][c] == 0.0) continue;
+            double f = a[r][c];
+            for (int k = 0; k < 8; ++k) a[r][k] -= f * a[c][k];
+        }
+    }
+    for (int r = 0; r < 4; ++r)
+        for (int c = 0; c < 4; ++c) inv[c * 4 + r] = a[r][4 + c];
+    return true;
+}
+
+// Camera reprojection from this frame's jittered clip space to last frame's clip space:
+// prevPV * (curPV)^-1 * T^-1 (T = the jitter translation, as in JitterInverse), in double.
+// The game's own projViewInverse is float: far from the map origin its rounding alone tells
+// DLSS that a still image moves by ~0.1 render pixels (0.12 px at 8 km). Inverting projView
+// here in double and folding both matrices into one keeps the large world translation out of
+// the float maths on the GPU, leaving ~0.0001 px (simulated; research/mv-precision).
+bool ReprojectionD(const float* curPV, const float* prevPV, float dx, float dy, float* out) {
+    double cur[16], prev[16], inv[16], r[16];
+    for (int i = 0; i < 16; ++i) {
+        cur[i] = curPV[i];
+        prev[i] = prevPV[i];
+    }
+    if (!InvertD(cur, inv)) return false;
+    for (int k = 0; k < 4; ++k) inv[12 + k] -= double(dx) * inv[0 + k] + double(dy) * inv[4 + k];
+    MulD(prev, inv, r);
+    for (int i = 0; i < 16; ++i) out[i] = (float)r[i];
+    return true;
+}
+
 // Pointer to this command buffer's camera UBO contents in mapped memory, or nullptr.
 const char* ViewData(const CmdState& cs) {
     if (!cs.hasView) return nullptr;
@@ -1719,15 +1779,24 @@ void UploadMvMatrices(const CmdState& cs) {
                 (unsigned long long)cs.viewOff);
         }
         std::memcpy(u.prevViewProj, (g_dlss.havePrev && !jump) ? g_dlss.prevPV : pv, 64);
+        // mv_double=1: replace the float inverse with the whole reprojection, built in double. The object
+        // pass keeps using prevViewProj; only the camera pass (camera_mv.comp) reads curInvViewProj.
+        static const float kIdentity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+        const float* tracePrev = u.prevViewProj;
+        if (g_cfg.mvDouble &&
+            ReprojectionD(pv, u.prevViewProj, 2.f * jx / (float)vw, -2.f * jy / (float)vh, u.curInvViewProj)) {
+            u.sizeAndScale[3] = 1.f;
+            tracePrev = kIdentity;
+        }
         if (g_frame < g_traceUntil) {
             static double lastMs = 0;
             double now = NowMs();
             float dx = cam[0] - g_dlss.prevCam[0], dy = cam[1] - g_dlss.prevCam[1], dz = cam[2] - g_dlss.prevCam[2];
             float mNear[2], mFar[2], mLeft[2];
             float W = (float)g_dlss.inW, Hh = (float)g_dlss.inH;
-            MotionAt(u.curInvViewProj, u.prevViewProj, 0.f, 0.f, 0.90f, W, Hh, mNear);  // screen centre, nearer
-            MotionAt(u.curInvViewProj, u.prevViewProj, 0.f, 0.f, 0.999f, W, Hh, mFar);  // screen centre, far
-            MotionAt(u.curInvViewProj, u.prevViewProj, -0.8f, 0.f, 0.99f, W, Hh, mLeft); // left edge
+            MotionAt(u.curInvViewProj, tracePrev, 0.f, 0.f, 0.90f, W, Hh, mNear);  // screen centre, nearer
+            MotionAt(u.curInvViewProj, tracePrev, 0.f, 0.f, 0.999f, W, Hh, mFar);  // screen centre, far
+            MotionAt(u.curInvViewProj, tracePrev, -0.8f, 0.f, 0.99f, W, Hh, mLeft); // left edge
             Log("[trace] frame %llu dt=%.2fms slot=%u cam=(%.2f,%.2f,%.2f) d=%.3f mv_centre_near=(%.2f,%.2f) "
                 "mv_centre_far=(%.2f,%.2f) mv_left=(%.2f,%.2f) mv=%s",
                 (unsigned long long)g_frame, now - lastMs, cs.mvSlot, cam[0], cam[1], cam[2],
@@ -1874,6 +1943,7 @@ void WriteCapture(const CaptureFrame& f) {
       << ",\n  \"jitter_px\": " << arr(f.ubo.jitterPx, 2)
       << ",\n  \"mv_enabled\": " << f.ubo.sizeAndScale[2]
       << ",\n  \"cur_inv_view_proj_jittered\": " << arr(f.ubo.curInvViewProj, 16)
+      << ",\n  \"cur_inv_is_reprojection\": " << (f.ubo.sizeAndScale[3] == 1.f ? "true" : "false")
       << ",\n  \"prev_view_proj\": " << arr(f.ubo.prevViewProj, 16) << ",\n  \"cur_view_proj\": " << arr(f.curPV, 16)
       << ",\n  \"matrix_layout\": \"column-major (GLSL)\"\n}\n";
     Log("[record] wrote %s (%ux%u)", base, w2, h2);

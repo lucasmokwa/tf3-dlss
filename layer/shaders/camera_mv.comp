@@ -9,6 +9,10 @@
 //   * GL-style projection; stored depth d maps to NDC z = 2d - 1 (see calcEyeZ in ssr_apply.fs).
 //   * curInvViewProj is the jittered inverse (the depth buffer was rendered with jitter);
 //     prevViewProj is last frame's unjittered matrix, so the result excludes jitter.
+//   * With mv_double=1 (sizeAndScale.w = 1) the layer instead puts the whole reprojection,
+//     prevViewProj * jittered inverse, built in double on the CPU, into curInvViewProj, and the
+//     world-space step is skipped: far from the map origin, float world positions and the game's
+//     float inverse alone add a ~0.1 px false motion to every pixel.
 //   * Pixel rows run top-down: row 0 is NDC y = +1 (verified against recorded frames - warping
 //     colour with these vectors only lines up with this orientation). Motion and jitter are in
 //     that same top-down pixel space, which is what DLSS expects.
@@ -25,7 +29,8 @@ layout(set = 0, binding = 1, std430) writeonly buffer MvOut { uint mvOut[]; };
 layout(set = 0, binding = 2, std140) uniform Matrices {
     mat4 curInvViewProj;   // this frame: projViewInverse
     mat4 prevViewProj;     // last frame: projView
-    vec4 sizeAndScale;     // xy = render size in pixels, z = 1 to enable, 0 to write zeros
+    vec4 sizeAndScale;     // xy = render size in pixels, z = 1 to enable, 0 to write zeros,
+                           // w = 1: curInvViewProj is the reprojection (current clip -> previous clip)
     vec4 jitterPx;         // xy = this frame's jitter in pixels (depth was rendered with it)
 } u;
 layout(set = 0, binding = 3, r32f) writeonly uniform image2D depthOut;
@@ -44,10 +49,14 @@ void main() {
     vec2 pix = vec2(p) + 0.5;
     vec4 ndc = vec4(pix.x / float(size.x) * 2.0 - 1.0, 1.0 - pix.y / float(size.y) * 2.0, d * 2.0 - 1.0, 1.0);
 
-    vec4 world = u.curInvViewProj * ndc;
-    world /= world.w;
-
-    vec4 prevClip = u.prevViewProj * world;
+    vec4 prevClip;
+    if (u.sizeAndScale.w == 1.0) {
+        prevClip = u.curInvViewProj * ndc;
+    } else {
+        vec4 world = u.curInvViewProj * ndc;
+        world /= world.w;
+        prevClip = u.prevViewProj * world;
+    }
     vec2 mv = vec2(0.0);
     if (prevClip.w > 1e-6) {
         vec2 prevNdc = prevClip.xy / prevClip.w;
