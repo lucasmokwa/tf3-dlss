@@ -258,6 +258,8 @@ struct Config {
     float resetDistance = 1000; // camera jump (world units per frame) that resets DLSS history
     int jitter = 1;             // sub-pixel camera jitter (needed for DLSS to resolve detail)
     int jitterPhases = 0;       // 0 = NVIDIA's recommendation for the current scale
+    int jitterScreenPasses = 0; // debug: 1 = also jitter full-screen passes (reflections, AO, bloom), as before 0.2
+    int jitterOtherTargets = 1; // jitter 3D draws into every render-size target, not just the main 3D pass
     int objectMotion = 1;       // motion vectors for moving objects (vehicles), not just the camera
     int objectDepthTest = 1;    // debug: 0 = draw object motion even where the object is hidden
     int fixHighlightDepth = 1;  // keep the hover highlight's overlay from writing depth (needs a restart)
@@ -342,6 +344,8 @@ bool LoadConfig() {
         else if (k == "debug_view") c.debugView = iv;
         else if (k == "jitter") c.jitter = iv;
         else if (k == "jitter_phases") c.jitterPhases = iv;
+        else if (k == "jitter_screen_passes") c.jitterScreenPasses = iv;
+        else if (k == "jitter_other_targets") c.jitterOtherTargets = iv;
         else if (k == "jitter_mode" || k == "debug_serialize") {}  // retired settings
         else if (k == "object_motion") c.objectMotion = iv;
         else if (k == "object_depth_test") c.objectDepthTest = iv;
@@ -666,6 +670,7 @@ struct PipeState {
     VkCullModeFlags cull = 0;
     VkPrimitiveTopology topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     std::string vsNames;         // a few identifiers from the vertex shader, to recognise it
+    std::string fsNames;         // the fragment shader's textures/uniforms
 };
 struct PipeViewport {
     bool dynamic = false;  // viewport is dynamic state (originally, or because we made it so)
@@ -687,6 +692,7 @@ std::unordered_map<VkPipeline, PipeVtx> g_pipeVtx;
 std::unordered_map<VkPipeline, PipeViewport> g_pipeVp;
 std::unordered_map<VkPipeline, PipeState> g_pipeState;
 std::unordered_map<VkShaderModule, std::string> g_moduleTag;  // short description of each vertex shader
+std::unordered_map<VkShaderModule, std::string> g_moduleRes;  // its textures/uniforms (ShaderResourceNames)
 std::unordered_map<VkImage, ImageInfo> g_images;
 std::unordered_map<VkImageView, VkImage> g_viewImage;
 std::unordered_map<VkFramebuffer, std::vector<VkImageView>> g_fbViews;
@@ -2282,6 +2288,19 @@ uint32_t FormatComps(VkFormat f) {
     }
 }
 bool ViewportJitterOn() { return JitterActive(); }
+
+// Which draws get the jitter. Only 3D geometry: full-screen passes (reflections, ambient occlusion,
+// bloom, ...) work per pixel on images that are already jittered, and shifting them as well made the
+// screen-space reflections flicker black on water. 3D draws are jittered in every render-size target,
+// so passes that the scene reads back (the water normals) line up with it. Caller holds g_t.
+bool JitterThisDraw(const CmdState& cs) {
+    if (!ViewportJitterOn()) return false;
+    auto ps = g_pipeState.find(cs.pipeline);
+    bool screenPass = ps != g_pipeState.end() && !ps->second.depthTest;
+    if (screenPass && !g_cfg.jitterScreenPasses) return false;
+    if (cs.fbIsScene) return true;
+    return g_cfg.jitterOtherTargets && !screenPass && g_dlss.inW && cs.fbW == g_dlss.inW && cs.fbH == g_dlss.inH;
+}
 // Solid geometry only: overlay lines/points drawn in 3D (guides, routes...) aren't objects.
 bool IsTriangles(VkPrimitiveTopology t) {
     return t == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST || t == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP ||
@@ -3952,6 +3971,36 @@ VsInfo ParseVertexShader(const uint32_t* w, size_t words) {
 }
 
 
+// Names of a shader's textures, uniform blocks and push constants (from the SPIR-V debug names), to
+// recognise fragment shaders in the draw log, e.g. "colorTex,waterDepthTex,u_water,...". Empty if
+// the module has no names.
+std::string ShaderResourceNames(const uint32_t* w, size_t words) {
+    if (words < 5 || w[0] != 0x07230203) return {};
+    std::unordered_map<uint32_t, std::string> names;
+    std::vector<uint32_t> vars;
+    for (size_t i = 5; i < words;) {
+        uint32_t n = w[i] >> 16, op = w[i] & 0xffff;
+        if (n == 0 || i + n > words) break;
+        if (op == 5 && n >= 3)  // OpName id "name"
+            names[w[i + 1]] = std::string(reinterpret_cast<const char*>(&w[i + 2]),
+                                          strnlen(reinterpret_cast<const char*>(&w[i + 2]), (n - 2) * 4));
+        else if (op == 59 && n >= 4) {  // OpVariable type id storage
+            uint32_t sc = w[i + 3];
+            if (sc == 0 || sc == 2 || sc == 9 || sc == 12) vars.push_back(w[i + 2]);  // uniform/push/storage
+        }
+        i += n;
+    }
+    std::string out;
+    int count = 0;
+    for (uint32_t id : vars) {
+        auto it = names.find(id);
+        if (it == names.end() || it->second.empty()) continue;
+        if (count++ == 8) { out += ",..."; break; }
+        out += (out.empty() ? "" : ",") + it->second;
+    }
+    return out;
+}
+
 static VKAPI_ATTR VkResult VKAPI_CALL tf3_CreateShaderModule(VkDevice device, const VkShaderModuleCreateInfo* pInfo,
                                                              const VkAllocationCallbacks* pAllocator,
                                                              VkShaderModule* pModule) {
@@ -3961,6 +4010,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_CreateShaderModule(VkDevice device, co
         if (!vi.tag.empty()) {
             std::lock_guard<std::recursive_mutex> lk(g_t);
             g_moduleTag[*pModule] = vi.tag;
+        }
+        std::string res = ShaderResourceNames(pInfo->pCode, pInfo->codeSize / 4);
+        if (!res.empty()) {
+            std::lock_guard<std::recursive_mutex> lk(g_t);
+            g_moduleRes[*pModule] = res;
         }
         if (vi.mdlLoc >= 0 || vi.skinned) {
             std::lock_guard<std::recursive_mutex> lk(g_t);
@@ -4075,6 +4129,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_CreateGraphicsPipelines(VkDevice devic
             if (ci.pStages[k].stage == VK_SHADER_STAGE_VERTEX_BIT) {
                 auto t = g_moduleTag.find(ci.pStages[k].module);
                 if (t != g_moduleTag.end()) st.vsNames = t->second;
+            } else if (ci.pStages[k].stage == VK_SHADER_STAGE_FRAGMENT_BIT) {
+                auto t = g_moduleRes.find(ci.pStages[k].module);
+                if (t != g_moduleRes.end()) st.fsNames = t->second;
             }
         g_pipeState[pPipelines[i]] = st;
     }
@@ -4733,7 +4790,7 @@ void ApplyViewport(DeviceData* d, VkCommandBuffer cb) {
         g_dlss.sceneVp = want;
         g_dlss.sceneVpValid = true;
     }
-    if (cs.fbIsScene && ViewportJitterOn()) {
+    if (JitterThisDraw(cs)) {
         float jx, jy;
         FrameJitter(jx, jy);
         want.x += jx;  // jitter is in top-down pixels, like framebuffer coordinates
@@ -4774,7 +4831,7 @@ static VKAPI_ATTR void VKAPI_CALL tf3_CmdSetScissor(VkCommandBuffer cb, uint32_t
     GetDevice(Key(cb))->CmdSetScissor(cb, first, count, pScissors);
 }
 
-// ---- Scene draw log (Ctrl+Shift+L): every draw into the scene framebuffer for one frame ------------
+// ---- Draw log (Ctrl+Shift+L): every draw of one frame, with its pass and whether it is jittered -----
 struct DrawLog {
     uint64_t frame = UINT64_MAX;  // frame being logged
     bool requested = false;
@@ -4787,7 +4844,6 @@ void LogSceneDraw(VkCommandBuffer cb, bool indexed, uint32_t count, uint32_t ins
     if (g_drawLog.frame != g_frame) return;
     std::lock_guard<std::recursive_mutex> lk(g_t);
     CmdState& cs = g_cmd[cb];
-    if (!cs.fbIsScene) return;
     if (cs.fb != g_drawLog.lastFb || cs.rp != g_drawLog.lastRp) {
         g_drawLog.lastFb = cs.fb;
         g_drawLog.lastRp = cs.rp;
@@ -4797,19 +4853,19 @@ void LogSceneDraw(VkCommandBuffer cb, bool indexed, uint32_t count, uint32_t ins
             if (ii != g_images.end()) atts += " " + std::to_string(ii->second.w) + "x" + std::to_string(ii->second.h) + ":" +
                                              std::to_string((int)ii->second.fmt);
         }
-        Log("[draws] -- render pass %s, framebuffer %s, attachments (format ids):%s", H(cs.rp).c_str(), H(cs.fb).c_str(),
-            atts.c_str());
+        Log("[draws] -- render pass %s, framebuffer %s, attachments (format ids):%s%s", H(cs.rp).c_str(),
+            H(cs.fb).c_str(), atts.c_str(), cs.fbIsScene ? " (main 3D pass)" : "");
     }
     auto ps = g_pipeState.find(cs.pipeline);
     PipeState st = ps == g_pipeState.end() ? PipeState{} : ps->second;
     auto pv = g_pipeVtx.find(cs.pipeline);
     uint64_t mesh = pv != g_pipeVtx.end() ? MeshHash(cs, pv->second, indexed, count, 0, 0) : 0;
-    Log("[draws] %4d pipe %s cmd %s: %s%u x%u inst | colour mask %x%s (%u att) | depth %s%s op %d | stencil %s pass %d | "
-        "cull %u topo %d | mesh %016llx | vs %s",
-        g_drawLog.index++, H(cs.pipeline).c_str(), H(cb).c_str(), indexed ? "idx " : "", count, instances, st.colorMask,
+    Log("[draws] %4d %s pipe %s cmd %s: %s%u x%u inst | colour mask %x%s (%u att) | depth %s%s op %d | stencil %s pass %d | "
+        "cull %u topo %d | mesh %016llx | vs %s | fs %s",
+        g_drawLog.index++, JitterThisDraw(cs) ? "JIT" : "---", H(cs.pipeline).c_str(), H(cb).c_str(), indexed ? "idx " : "", count, instances, st.colorMask,
         st.blend ? " blend" : "", st.attachments, st.depthTest ? "test" : "-", st.depthWrite ? "+write" : "",
         (int)st.depthOp, st.stencil ? "on" : "off", (int)st.stencilPass, (unsigned)st.cull, (int)st.topology,
-        (unsigned long long)mesh, st.vsNames.c_str());
+        (unsigned long long)mesh, st.vsNames.c_str(), st.fsNames.c_str());
 }
 
 // ---- Moving-mesh discovery ---------------------------------------------------------------------
@@ -5042,7 +5098,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_QueuePresentKHR(VkQueue queue, const V
         //   Ctrl+Shift+V  cycle debug views: off -> motion vectors -> jitter
         //   Ctrl+Shift+T  automated camera test with a per-frame trace; press again to cancel
         //   Ctrl+Shift+Y  automated small-tilt wobble test, records 8 frames in a row
-        //   Ctrl+Shift+L  log every draw into the 3D scene for one frame
+        //   Ctrl+Shift+L  log every draw of one frame (pass, jitter, pipeline state, shader names)
         //   Ctrl+Shift+J  jitter on/off
         //   Ctrl+Shift+O  on-screen info box on/off
         //   Ctrl+Shift+Up/Down  sharpness of the running upscaler +/- 0.1 (sharpness / fsr_sharpness)
@@ -5110,7 +5166,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_QueuePresentKHR(VkQueue queue, const V
         if (devPressed('L', lWasDown)) {
             g_drawLog = DrawLog{};
             g_drawLog.frame = g_frame + 2;  // a whole frame from its start
-            Log("[draws] Ctrl+Shift+L: logging every scene draw of frame %llu", (unsigned long long)g_drawLog.frame);
+            Log("[draws] Ctrl+Shift+L: logging every draw of frame %llu", (unsigned long long)g_drawLog.frame);
         }
         static bool yWasDown = false;
         bool tHit = devPressed('T', tWasDown), yHit = devPressed('Y', yWasDown);
