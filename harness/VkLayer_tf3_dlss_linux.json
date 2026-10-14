@@ -1,0 +1,14 @@
+{
+  "file_format_version": "1.2.0",
+  "layer": {
+    "name": "VK_LAYER_TF3_dlss",
+    "type": "GLOBAL",
+    "library_path": "./VkLayer_tf3_dlss.so",
+    "api_version": "1.4.341",
+    "implementation_version": "100",
+    "description": "TF3-DLSS, test build for the harness (no DLSS, test upscaler).",
+    "functions": {
+      "vkNegotiateLoaderLayerInterfaceVersion": "tf3_NegotiateLoaderLayerInterfaceVersion"
+    }
+  }
+}

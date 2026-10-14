@@ -37,6 +37,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <atomic>
 #include <cmath>
 #include <cstdarg>
@@ -990,8 +991,20 @@ std::pair<int, int> FindSampled(const CmdState& cs, VkImage img) {
 // =============================================================================================
 // DLSS state
 // =============================================================================================
-enum class Backend { None, Dlss, Fsr };
-const char* BackendName(Backend b) { return b == Backend::Dlss ? "DLSS" : b == Backend::Fsr ? "FSR 3.1" : "none"; }
+enum class Backend { None, Dlss, Fsr, Test };
+const char* BackendName(Backend b) {
+    return b == Backend::Dlss ? "DLSS" : b == Backend::Fsr ? "FSR 3.1" : b == Backend::Test ? "test upscaler" : "none";
+}
+// TF3_DLSS_TEST_UPSCALER=1 (the test harness): a bilinear resize (test_upscale.comp) replaces DLSS and
+// FSR 3.1, so everything around the upscaler can be tested on any GPU. Not a cfg setting on purpose.
+bool TestUpscaler() {
+    static int on = -1;
+    if (on < 0) {
+        const char* e = std::getenv("TF3_DLSS_TEST_UPSCALER");
+        on = e && *e == '1' ? 1 : 0;
+    }
+    return on != 0;
+}
 
 // Shared upscaler state (the name is historical: it holds DLSS and everything common to both).
 struct Dlss {
@@ -1078,6 +1091,16 @@ struct Dlss {
     VkImage shpImage = VK_NULL_HANDLE;   // temporary result, copied back into outImage
     VkImageView shpView = VK_NULL_HANDLE;
     VkImageView shpBoundOut = VK_NULL_HANDLE;
+    // test upscaler (TestUpscaler)
+    bool tstFailed = false;
+    VkDescriptorSetLayout tstSetLayout = VK_NULL_HANDLE;
+    VkPipelineLayout tstPipeLayout = VK_NULL_HANDLE;
+    VkPipeline tstPipeline = VK_NULL_HANDLE;
+    VkDescriptorPool tstPool = VK_NULL_HANDLE;
+    VkSampler tstSampler = VK_NULL_HANDLE;
+    VkImageView tstBoundOut = VK_NULL_HANDLE;  // the output view the cached sets point at
+    std::vector<std::pair<VkImageView, VkDescriptorSet>> tstSets;  // one per input colour view
+    bool tstSetUsed = false;
     // on-screen info box (overlay.comp)
     bool ovFailed = false, ovSetUsed = false;
     VkDescriptorSetLayout ovSetLayout = VK_NULL_HANDLE;
@@ -1230,19 +1253,38 @@ struct Capture {
     std::vector<CaptureFrame> pending;  // filled at submit, written after the GPU finishes
 } g_cap;
 
+// TF3_DLSS_CAPTURE=90,190 (test harness): record two frames in a row after each of these frames,
+// as the Ctrl+Shift+T test does.
+bool CaptureRequestedAt(uint64_t frame) {
+    static std::vector<uint64_t> frames = [] {
+        std::vector<uint64_t> v;
+        const char* e = std::getenv("TF3_DLSS_CAPTURE");
+        for (const char* p = e; p && *p;) {
+            char* end = nullptr;
+            unsigned long long f = std::strtoull(p, &end, 10);
+            if (end == p) break;
+            v.push_back(f);
+            p = *end ? end + 1 : end;
+        }
+        return v;
+    }();
+    return std::find(frames.begin(), frames.end(), frame) != frames.end();
+}
+bool RecordingPossible() {
+    static const bool env = [] {
+        const char* e = std::getenv("TF3_DLSS_CAPTURE");
+        return e && *e;
+    }();
+    return env || g_cfg.debugKeys;
+}
+
 // Frame trace (Ctrl+Shift+T): one log line per frame for kTraceFrames frames.
 constexpr uint64_t kTraceFrames = 240;
 uint64_t g_traceUntil = 0;
 
 double NowMs() {
-#ifdef _WIN32
-    static LARGE_INTEGER freq = [] { LARGE_INTEGER f; QueryPerformanceFrequency(&f); return f; }();
-    LARGE_INTEGER t;
-    QueryPerformanceCounter(&t);
-    return 1000.0 * (double)t.QuadPart / (double)freq.QuadPart;
-#else
-    return 0.0;
-#endif
+    using namespace std::chrono;
+    return duration<double, std::milli>(steady_clock::now().time_since_epoch()).count();
 }
 
 // Frames per second for the info box: frames presented in the last half second or so.
@@ -1493,6 +1535,9 @@ void InvalidateViewCaches(DeviceData* d) {
     g_dlss.mvDepthView = g_dlss.objDepthView = VK_NULL_HANDLE;
     g_dlss.mvSetUsed = g_dlss.objSetUsed = g_dlss.dbgSetUsed = false;
     g_dlss.dbgBoundMv = VK_NULL_HANDLE;  // forces the debug view to rebuild its sets too
+    if (g_dlss.tstPool) d->ResetDescriptorPool(d->device, g_dlss.tstPool, 0);
+    g_dlss.tstSets.clear();
+    g_dlss.tstSetUsed = false;
 }
 
 // Pipeline objects (once) and the per-size buffer. Caller holds g_t.
@@ -2078,7 +2123,7 @@ bool EnsureImages(DeviceData* d, uint32_t inW, uint32_t inH, uint32_t outW, uint
         if (g_dlss.mvImage) Log("[upscale] render size changed to %ux%u", inW, inH);
         if (!CreateOwnImage(d, inW, inH, VK_FORMAT_R16G16_SFLOAT,
                             VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-                                VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+                                VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,  // recordings
                             &g_dlss.mvImage, &g_dlss.mvView) ||
             !CreateOwnImage(d, inW, inH, VK_FORMAT_R32_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
                             &g_dlss.depth32Image, &g_dlss.depth32View)) {
@@ -3354,6 +3399,109 @@ void RecordOverlay(DeviceData* d, VkCommandBuffer cb, Backend backend, const Cmd
 }
 
 // ---------------------------------------------------------------------------------------------
+// Test upscaler (TestUpscaler): bilinear resize of the input colour into outImage
+// ---------------------------------------------------------------------------------------------
+const uint32_t kTstSpirv[] = {
+#include "test_upscale.spv.inc"
+};
+constexpr uint32_t kTstSets = 8;
+
+bool EnsureTestUpscale(DeviceData* d) {
+    if (g_dlss.tstFailed) return false;
+    if (!g_dlss.tstPipeline) {
+        g_dlss.tstFailed = true;  // cleared on success
+        VkDescriptorSetLayoutBinding b[2] = {};
+        b[0] = {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+        b[1] = {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+        VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        li.bindingCount = 2;
+        li.pBindings = b;
+        if (d->CreateDescriptorSetLayout(d->device, &li, nullptr, &g_dlss.tstSetLayout) != VK_SUCCESS) return false;
+        VkPushConstantRange pr{VK_SHADER_STAGE_COMPUTE_BIT, 0, 8};
+        VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        pli.setLayoutCount = 1;
+        pli.pSetLayouts = &g_dlss.tstSetLayout;
+        pli.pushConstantRangeCount = 1;
+        pli.pPushConstantRanges = &pr;
+        if (d->CreatePipelineLayout(d->device, &pli, nullptr, &g_dlss.tstPipeLayout) != VK_SUCCESS) return false;
+        VkShaderModuleCreateInfo si{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        si.codeSize = sizeof kTstSpirv;
+        si.pCode = kTstSpirv;
+        VkShaderModule mod;
+        if (d->CreateShaderModule(d->device, &si, nullptr, &mod) != VK_SUCCESS) return false;
+        VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        ci.stage.module = mod;
+        ci.stage.pName = "main";
+        ci.layout = g_dlss.tstPipeLayout;
+        VkResult r = d->CreateComputePipelines(d->device, VK_NULL_HANDLE, 1, &ci, nullptr, &g_dlss.tstPipeline);
+        d->DestroyShaderModule(d->device, mod, nullptr);
+        if (r != VK_SUCCESS) return false;
+        VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kTstSets},
+                                        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, kTstSets}};
+        VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        pi.maxSets = kTstSets;
+        pi.poolSizeCount = 2;
+        pi.pPoolSizes = sizes;
+        if (d->CreateDescriptorPool(d->device, &pi, nullptr, &g_dlss.tstPool) != VK_SUCCESS) return false;
+        VkSamplerCreateInfo smp{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+        smp.magFilter = smp.minFilter = VK_FILTER_LINEAR;
+        smp.addressModeU = smp.addressModeV = smp.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        if (d->CreateSampler(d->device, &smp, nullptr, &g_dlss.tstSampler) != VK_SUCCESS) return false;
+        g_dlss.tstFailed = false;
+        Log("[test] test upscaler ready (TF3_DLSS_TEST_UPSCALER=1)");
+    }
+    if (g_dlss.tstBoundOut != g_dlss.outView) {  // output image recreated: the sets point at the old one
+        if (g_dlss.tstSetUsed) d->DeviceWaitIdle(d->device);
+        d->ResetDescriptorPool(d->device, g_dlss.tstPool, 0);
+        g_dlss.tstSets.clear();
+        g_dlss.tstSetUsed = false;
+        g_dlss.tstBoundOut = g_dlss.outView;
+    }
+    return true;
+}
+
+// Input colour in SHADER_READ_ONLY_OPTIMAL, outImage in GENERAL. Caller holds g_t.
+bool RecordTestUpscale(DeviceData* d, VkCommandBuffer cb, const CmdState& cs) {
+    if (!EnsureTestUpscale(d)) return false;
+    bool isNew = false;
+    VkDescriptorSet set = CachedSetRaw(d, g_dlss.tstSets, cs.colorView, g_dlss.tstPool, g_dlss.tstSetLayout,
+                                       g_dlss.tstSetUsed, isNew);
+    if (!set) return false;
+    if (isNew) {
+        VkDescriptorImageInfo src{g_dlss.tstSampler, cs.colorView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        VkDescriptorImageInfo dst{VK_NULL_HANDLE, g_dlss.outView, VK_IMAGE_LAYOUT_GENERAL};
+        VkWriteDescriptorSet w[2] = {};
+        w[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, set, 0, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                &src, nullptr, nullptr};
+        w[1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, set, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &dst,
+                nullptr, nullptr};
+        d->UpdateDescriptorSets(d->device, 2, w, 0, nullptr);
+    }
+    VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    b.image = g_dlss.outImage;
+    b.oldLayout = b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    b.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    b.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr,
+                          0, nullptr, 1, &b);
+    int32_t size[2] = {(int32_t)g_dlss.outW, (int32_t)g_dlss.outH};
+    d->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_dlss.tstPipeline);
+    d->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_dlss.tstPipeLayout, 0, 1, &set, 0, nullptr);
+    d->CmdPushConstants(cb, g_dlss.tstPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof size, size);
+    d->CmdDispatch(cb, (g_dlss.outW + 7) / 8, (g_dlss.outH + 7) / 8, 1);
+    b.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr,
+                          0, nullptr, 1, &b);
+    g_dlss.tstSetUsed = true;
+    return true;
+}
+
+// ---------------------------------------------------------------------------------------------
 // Which upscaler runs
 // ---------------------------------------------------------------------------------------------
 UpscalerPref ActivePref() {
@@ -3378,8 +3526,9 @@ Backend ChooseBackend() {
     bool dlssOk = g_dlss.ngxReady && !g_dlss.failed;
     auto fsrOk = [] { return !g_fsr.failed && FsrLoad(); };
     Backend b = Backend::None;
+    if (TestUpscaler()) p = p == UpscalerPref::Off ? p : UpscalerPref::Auto;
     switch (p) {
-        case UpscalerPref::Auto: b = dlssOk ? Backend::Dlss : fsrOk() ? Backend::Fsr : Backend::None; break;
+        case UpscalerPref::Auto: b = TestUpscaler() ? Backend::Test : dlssOk ? Backend::Dlss : fsrOk() ? Backend::Fsr : Backend::None; break;
         case UpscalerPref::Dlss: b = dlssOk ? Backend::Dlss : Backend::None; break;
         case UpscalerPref::Fsr: b = fsrOk() ? Backend::Fsr : Backend::None; break;
         case UpscalerPref::Off: break;
@@ -3502,6 +3651,10 @@ void RecordUpscale(DeviceData* d, VkCommandBuffer cb, CmdState& cs) {
         g_dlss.mvSetUsed = true;
         cs.mvSlot = slot;
         cs.mvPending = true;
+        if (g_cap.requested > 0 && !((ci.usage & di.usage) & VK_IMAGE_USAGE_TRANSFER_SRC_BIT)) {
+            Log("[record] the game's colour/depth images can't be copied (set debug_keys=1 and restart the game)");
+            g_cap.requested = 0;
+        }
         if (g_cap.requested > 0 && EnsureCaptureBuffers(d, ci.w, ci.h)) {
             RecordCaptureCopies(d, cb, cs, depthAspects);
             --g_cap.requested;
@@ -3555,8 +3708,10 @@ void RecordUpscale(DeviceData* d, VkCommandBuffer cb, CmdState& cs) {
         NVSDK_NGX_Result r = NGX_VULKAN_EVALUATE_DLSS_EXT(cb, g_dlss.handle, g_dlss.params, &ep);
         ok = NVSDK_NGX_SUCCEED(r);
         dlssResult = (unsigned)r;
-    } else {
+    } else if (backend == Backend::Fsr) {
         ok = RecordFsr(cb, cs, ci);
+    } else {
+        ok = RecordTestUpscale(d, cb, cs);
     }
     GpuMark(d, cb, kGmUpscaler);
 
@@ -3571,7 +3726,7 @@ void RecordUpscale(DeviceData* d, VkCommandBuffer cb, CmdState& cs) {
                 VK_IMAGE_LAYOUT_GENERAL);
     }
     g_cap.outPending = false;
-    if (ok && backend == Backend::Dlss) RecordSharpen(d, cb);  // FSR sharpens itself (RCAS)
+    if (ok && backend != Backend::Fsr) RecordSharpen(d, cb);  // FSR sharpens itself (RCAS)
     GpuMark(d, cb, kGmSharpen);
     if (g_cfg.debugView && ok && (g_cfg.debugView == 2 || cs.mvPending)) RecordDebugView(d, cb, cs);
     if (ok) RecordOverlay(d, cb, backend, cs, ci.w, ci.h);
@@ -4740,6 +4895,12 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_CreateImage(VkDevice device, const VkI
         info.usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
         addedSampled = true;
     }
+    // Recordings (Ctrl+Shift+T, TF3_DLSS_CAPTURE) copy the depth and the upscaler's input colour out, which
+    // needs TRANSFER_SRC. Only added when recordings are possible: players' images stay as the game made them.
+    if (RecordingPossible() && info.imageType == VK_IMAGE_TYPE_2D && info.extent.width >= 1000 &&
+        (info.usage & (VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) &&
+        (info.usage & VK_IMAGE_USAGE_SAMPLED_BIT))
+        info.usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
     DeviceData* d = GetDevice(Key(device));
     VkResult r = d->CreateImage(device, &info, pAllocator, pImage);
     if (r != VK_SUCCESS && addedSampled) {
@@ -5666,6 +5827,10 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_QueuePresentKHR(VkQueue queue, const V
                 (unsigned long long)g_frame);
         }
 #endif
+        if (CaptureRequestedAt(g_frame)) {
+            g_cap.requested = 2;
+            g_cap.phase = "frame " + std::to_string(g_frame);
+        }
         if (g_cfg.cfgLive && g_frame % 60 == 0 && ConfigChanged()) {
             int wasEnabled = g_cfg.enabled;
             UpscalerPref wasPref = g_cfg.upscaler;

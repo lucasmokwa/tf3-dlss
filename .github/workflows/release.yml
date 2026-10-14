@@ -57,8 +57,43 @@ jobs:
           echo "publish=$publish" >> "$GITHUB_OUTPUT"
           echo "layer.cpp $src, latest release ${latest:-none} -> version $ver, publish=$publish"
 
+  # Runs the layer in harness/fake_tf3 on Mesa's CPU Vulkan driver (lavapipe), with a test upscaler in
+  # place of DLSS / FSR and the Khronos validation layer: motion vectors, the blit swap, validation.
+  # A failure stops the build, so nothing is released.
+  harness:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Get the NVIDIA DLSS SDK headers
+        uses: actions/checkout@v4
+        with:
+          repository: NVIDIA/DLSS
+          ref: ${{ env.DLSS_SDK_REF }}
+          path: _sdk/DLSS
+          sparse-checkout: include
+          sparse-checkout-cone-mode: true
+      - name: Install Vulkan (lavapipe, validation layer, glslang)
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends cmake ninja-build g++ libvulkan-dev \
+            mesa-vulkan-drivers vulkan-validationlayers vulkan-tools glslang-tools
+      - name: Build
+        run: |
+          cmake -S harness -B build/harness -G Ninja -DCMAKE_BUILD_TYPE=Release -DDLSS_SDK="$PWD/_sdk/DLSS"
+          cmake --build build/harness
+      - name: Run
+        run: harness/run.sh build/harness logs/harness
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: harness-results
+          path: |
+            logs/harness/**/fake_tf3.txt
+            logs/harness/**/result.json
+            logs/harness/**/tf3_dlss.log
+
   build:
-    needs: version
+    needs: [version, harness]
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4

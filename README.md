@@ -112,6 +112,31 @@ still in the same scene and change one cfg line at a time (most apply live), or 
 upscaler with Ctrl+Shift+D (`debug_keys=1`): with it off the report shows what the layer's tracking
 alone costs. `skip_game_fsr=1` leaves out the game's FSR 1 draws while an upscaler runs.
 
+## Testing without the game
+
+`harness/fake_tf3` is a small Vulkan program that renders frames shaped like TF3's (3D scene with
+the game's vertex inputs and camera block, tonemap, FSR 1 EASU and RCAS, blit, UI) and checks what the
+layer does with them:
+
+- the upscaled image reaches the screen: the FSR 1 stand-ins draw magenta, so any magenta left
+  means the blit swap failed, and the UI must stay on top;
+- motion vectors, from recordings of a still camera, a sideways pan and an upward pan with an object
+  moving in front of a wall, match the exact values to within 0.02 px;
+- no Khronos validation errors;
+- its CPU time per frame with and without the layer (the scene is recorded on 4 threads, like the game).
+
+```powershell
+cd scripts
+.\run_harness.ps1                 # with DLSS / FSR 3.1 from build\bin
+.\run_harness.ps1 -Validation     # plus the validation layer (Vulkan SDK)
+.\run_harness.ps1 -TestUpscaler   # a plain resize in place of DLSS / FSR, as in CI
+```
+
+Results go to `logs\harness`. CI runs the same checks on Linux before every build (`harness/run.sh`):
+there the layer is built as a shared library with NGX stubbed out (`harness/ngx_stub.cpp`), on Mesa's
+CPU Vulkan driver, and `TF3_DLSS_TEST_UPSCALER=1` swaps DLSS and FSR for a bilinear resize. A failing
+check stops the build, so nothing is released.
+
 ## Releasing
 
 Every push to `main` is released by GitHub Actions (`.github/workflows/release.yml`), as the next

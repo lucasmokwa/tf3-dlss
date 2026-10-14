@@ -1,0 +1,20 @@
+#version 450
+// Test upscaler (TF3_DLSS_TEST_UPSCALER=1, used by the test harness only): a plain bilinear resize
+// in place of DLSS / FSR 3.1, so everything around the upscaler (motion vectors, the blit swap,
+// sharpening, the info box, timings) runs on any GPU, including the CPU Vulkan driver in CI.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D src;                // the upscaler's input colour
+layout(set = 0, binding = 1, rgba8) uniform writeonly image2D dst;  // our output image
+
+layout(push_constant) uniform Params {
+    ivec2 size;  // output size
+} pc;
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(p, pc.size))) return;
+    vec2 uv = (vec2(p) + 0.5) / vec2(pc.size);
+    imageStore(dst, p, vec4(textureLod(src, uv, 0.0).rgb, 1.0));
+}
