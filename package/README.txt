@@ -81,8 +81,12 @@ Delete version.dll and the TF3-DLSS folder from the game folder.
 
 CREDITS AND LICENSES
 --------------------
-TF3-DLSS: MIT license, see licenses\TF3-DLSS-LICENSE.txt.
-Uses the NVIDIA DLSS SDK and the AMD FidelityFX SDK (FSR 3.1); their
-runtimes are included unmodified. See licenses\THIRD-PARTY.txt.
+Uses NVIDIA DLSS (NVIDIA DLSS SDK) and AMD FSR 3.1 (AMD FidelityFX SDK);
+their runtimes are included unmodified.
+TF3-DLSS's own source code is MIT licensed (licenses\TF3-DLSS-LICENSE.txt).
+The NVIDIA files (bin\nvngx_dlss.dll, and the NVIDIA library inside
+bin\VkLayer_tf3_dlss.dll) are not: they may only be used with this mod, not
+redistributed on their own, modified or reverse engineered. Full terms in
+licenses\THIRD-PARTY.txt.
 NVIDIA, RTX and DLSS are trademarks of NVIDIA Corporation. AMD, FidelityFX and
 FSR are trademarks of Advanced Micro Devices, Inc.

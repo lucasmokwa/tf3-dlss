@@ -135,8 +135,10 @@ Changes made with these keys last until the cfg file is saved again.
 
 ## License
 
-MIT for the code in this repository (see `LICENSE`). The DLSS and FSR runtimes in releases come
-under their own licences; see `package/licenses/THIRD-PARTY.txt`.
+MIT for the source code in this repository (see `LICENSE`). Release binaries also contain NVIDIA
+code that the MIT license doesn't cover: `VkLayer_tf3_dlss.dll` links NVIDIA's NGX SDK library, and
+`nvngx_dlss.dll` is NVIDIA's DLSS runtime. Those stay under NVIDIA's terms, which the release passes
+on to players. The FSR runtime is AMD's, under MIT. See `package/licenses/THIRD-PARTY.txt`.
 
 This software contains source code provided by NVIDIA Corporation. NVIDIA, RTX and DLSS are
 trademarks of NVIDIA Corporation; AMD, FidelityFX and FSR are trademarks of Advanced Micro
