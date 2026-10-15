@@ -34,7 +34,8 @@ layout(set = 0, binding = 2, std140) uniform Matrices {
     mat4 prevViewProj;     // last frame: projView
     vec4 sizeAndScale;     // xy = render size in pixels, z = 1 to enable, 0 to write zeros,
                            // w = 1: curInvViewProj is the reprojection (current clip -> previous clip)
-    vec4 jitterPx;         // xy = this frame's jitter in pixels (depth was rendered with it)
+    vec4 jitterPx;         // xy = this frame's jitter in pixels (depth was rendered with it),
+                           // z = 1: write the un-jittered depth (contour_fix)
 } u;
 layout(set = 0, binding = 3, r32f) writeonly uniform image2D depthOut;
 layout(set = 0, binding = 4, r32f) writeonly uniform image2D unjitteredDepthOut;
@@ -71,7 +72,7 @@ void main() {
         return;
     }
 
-    imageStore(unjitteredDepthOut, p, vec4(UnjitteredDepth(p, size, u.jitterPx.xy)));
+    if (u.jitterPx.z != 0.0) imageStore(unjitteredDepthOut, p, vec4(UnjitteredDepth(p, size, u.jitterPx.xy)));
 
     vec2 pix = vec2(p) + 0.5;
     vec4 ndc = vec4(pix.x / float(size.x) * 2.0 - 1.0, 1.0 - pix.y / float(size.y) * 2.0, d * 2.0 - 1.0, 1.0);

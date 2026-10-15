@@ -899,6 +899,8 @@ struct HotState {
     std::atomic<uint64_t> jitterFrame{UINT64_MAX};  // the frame jitterXY belongs to
     std::atomic<uint64_t> jitterXY{0};         // that frame's jitter, two floats
 } g_hot;
+// The un-jittered depth (g_dlss.contourImage) was written since it was created; else it's undefined.
+std::atomic<bool> g_contourWritten{false};
 // Meshes that moved recently (g_movingMeshes), rebuilt at present; a render pass takes a reference.
 std::shared_ptr<const std::unordered_set<uint64_t>> g_movingSnap;
 VkExtent2D g_swapExtent = {0, 0};
@@ -1119,7 +1121,6 @@ struct Dlss {
     // motion-vector pass, then read by the next frame's terrain draws
     VkImage contourImage = VK_NULL_HANDLE;
     VkImageView contourView = VK_NULL_HANDLE;
-    bool contourWritten = false;  // written at least once since it was created (else it's undefined)
     bool resetNext = true;
     // our resources
     VkImage outImage = VK_NULL_HANDLE;
@@ -1320,7 +1321,7 @@ struct MvUbo {
                                // whole reprojection (current clip -> previous clip, see UploadMvMatrices)
     float prevViewProj[16];    // unjittered
     float sizeAndScale[4];     // xy = render size, z = 1 for motion, w = 1 if curInvViewProj is the reprojection
-    float jitterPx[4];         // this frame's jitter in render pixels (xy)
+    float jitterPx[4];         // this frame's jitter in render pixels (xy); z = 1: write the un-jittered depth
     // object motion pass (object_mv.vert/.frag)
     float curViewProj[16];     // unjittered (jitter comes from the viewport)
     float params[4];           // near, far, 1 = flip y in the shader
@@ -2033,6 +2034,7 @@ void UploadMvMatrices(const CmdState& cs) {
             JitterInverse(u.curInvViewProj, 2.f * jx / (float)vw, -2.f * jy / (float)vh);
         u.jitterPx[0] = jx;
         u.jitterPx[1] = jy;
+        u.jitterPx[2] = g_cfg.contourFix ? 1.f : 0.f;  // contour_fix=0 skips that work (comparable with perf=1)
         bool jump = false;
         if (g_dlss.havePrev) {
             float dx = cam[0] - g_dlss.prevCam[0], dy = cam[1] - g_dlss.prevCam[1], dz = cam[2] - g_dlss.prevCam[2];
@@ -2255,7 +2257,7 @@ bool EnsureImages(DeviceData* d, uint32_t inW, uint32_t inH, uint32_t outW, uint
             return false;
         }
         g_dlss.mvLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        g_dlss.contourWritten = false;
+        g_contourWritten = false;
         g_dlss.inW = inW;
         g_dlss.inH = inH;
         g_dlss.resetNext = true;
@@ -3787,7 +3789,7 @@ void RecordUpscale(DeviceData* d, VkCommandBuffer cb, CmdState& cs) {
         d->CmdDispatch(cb, (ci.w + 7) / 8, (ci.h + 7) / 8, 1);
         Barrier(d, cb, g_dlss.depth32Image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, RO);
         Barrier(d, cb, g_dlss.contourImage, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, RO);
-        g_dlss.contourWritten = true;
+        g_contourWritten = true;
         VkBufferMemoryBarrier bb{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
         bb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
         bb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
@@ -4003,6 +4005,8 @@ VkDescriptorSet BlitSet(DeviceData* d, VkDescriptorSet gameSet, uint32_t binding
 // every frame. For those draws only, the layer binds a copy of the set with colorMapDepthTex
 // pointing at its own un-jittered depth (camera_mv.comp, binding 4), made from last frame's depth
 // too. Everything else that reads the game's depth copy is unchanged.
+// Guards g_contour and our pools. Not g_t: the swaps happen while the game records on several threads.
+std::mutex g_contourLock;
 struct ContourState {
     static constexpr int kPools = 8;  // one per frame, reset when it comes round again
     VkDescriptorPool pools[kPools] = {};
@@ -4016,11 +4020,12 @@ struct ContourState {
     bool loggedFirst = false;
 } g_contour;
 
-bool ContourOn() {
-    return g_cfg.contourFix && ViewportJitterOn() && g_dlss.contourWritten && !g_contour.failed;
+bool ContourOn() {  // caller holds g_t
+    std::lock_guard<std::mutex> cl(g_contourLock);
+    return g_cfg.contourFix && ViewportJitterOn() && g_contourWritten && !g_contour.failed;
 }
 
-// Pools sized for `layout` x 8 sets. Caller holds g_t.
+// Pools sized for `layout` x 8 sets. Caller holds g_contourLock and g_descLock (shared).
 bool EnsureContourPools(DeviceData* d, VkDescriptorSetLayout layout) {
     if (g_contour.pools[0]) return true;
     auto lb = g_setLayouts.find(layout);
@@ -4047,12 +4052,14 @@ bool EnsureContourPools(DeviceData* d, VkDescriptorSetLayout layout) {
 
 // This frame's copy of the game's set with `binding` pointing at our un-jittered depth. A fresh copy
 // each frame (the game may change its set between frames; a set a pending frame still uses can't be
-// rewritten), from a pool that is reset 8 frames later. Caller holds g_t.
+// rewritten), from a pool that is reset 8 frames later. Caller holds g_contourLock.
 VkDescriptorSet ContourSet(DeviceData* d, VkDescriptorSet gameSet, uint32_t binding) {
-    if (g_contour.setsFrame == g_frame) {
+    const uint64_t frame = g_hot.frame.load(std::memory_order_acquire);
+    if (g_contour.setsFrame == frame) {
         auto it = g_contour.sets.find(gameSet);
         if (it != g_contour.sets.end()) return it->second;
     }
+    std::shared_lock<std::shared_mutex> dl(g_descLock);
     auto lo = g_setLayoutOf.find(gameSet);
     if (lo == g_setLayoutOf.end()) return VK_NULL_HANDLE;
     auto lb = g_setLayouts.find(lo->second);
@@ -4070,13 +4077,13 @@ VkDescriptorSet ContourSet(DeviceData* d, VkDescriptorSet gameSet, uint32_t bind
     if (!EnsureContourPools(d, lo->second)) return giveUp("couldn't create descriptor pools");
     if (g_contour.poolUab != (g_updateAfterBindLayouts.count(lo->second) != 0))
         return giveUp("the game's set layouts differ in update-after-bind");
-    int slot = (int)(g_frame % ContourState::kPools);
-    if (g_contour.setsFrame != g_frame) {
-        g_contour.setsFrame = g_frame;
+    int slot = (int)(frame % ContourState::kPools);
+    if (g_contour.setsFrame != frame) {
+        g_contour.setsFrame = frame;
         g_contour.sets.clear();
-        if (g_contour.poolFrame[slot] != g_frame) {  // sets from 8 frames ago: long finished
+        if (g_contour.poolFrame[slot] != frame) {  // sets from 8 frames ago: long finished
             d->ResetDescriptorPool(d->device, g_contour.pools[slot], 0);
-            g_contour.poolFrame[slot] = g_frame;
+            g_contour.poolFrame[slot] = frame;
         }
     }
     VkDescriptorSetLayout layout = lo->second;
@@ -4087,7 +4094,7 @@ VkDescriptorSet ContourSet(DeviceData* d, VkDescriptorSet gameSet, uint32_t bind
     VkDescriptorSet ours = VK_NULL_HANDLE;
     if (d->AllocateDescriptorSets(d->device, &ai, &ours) != VK_SUCCESS) {
         Log("[contour] frame %llu: no descriptor set left this frame; these terrain draws keep the game's depth",
-            (unsigned long long)g_frame);
+            (unsigned long long)frame);
         return VK_NULL_HANDLE;
     }
     std::vector<VkCopyDescriptorSet> copies;
@@ -4116,15 +4123,19 @@ VkDescriptorSet ContourSet(DeviceData* d, VkDescriptorSet gameSet, uint32_t bind
 // While a terrain pipeline that reads colorMapDepthTex is bound in the scene pass, keep our copy of its
 // set bound in place of the game's; put the game's back when another pipeline is bound. Called after
 // the game binds a pipeline or descriptor sets and when a render pass begins, so the per-draw path
-// stays free of it (the game rebinds per-object sets between draws, not this one). No lock unless
-// there is something to do.
+// stays free of it (the game rebinds per-object sets between draws, not this one). Only
+// g_contourLock, and only when there is something to do.
 bool ContourWanted(const CmdState& cs) {
     return cs.pipe && cs.pipe->contourSet >= 0 && cs.fbIsScene && g_hot.contour.load(std::memory_order_relaxed);
 }
 void ContourSync(DeviceData* d, VkCommandBuffer cb, CmdState& cs) {
     bool want = ContourWanted(cs);
     if (!want && !cs.contourBound) return;
-    TLock lk(g_t);
+    if (want && !cs.contourBound) {  // nothing to swap yet: the game hasn't bound that set in this buffer
+        uint32_t si = (uint32_t)cs.pipe->contourSet;
+        if (si >= cs.sets.size() || !cs.sets[si].set) return;
+    }
+    std::lock_guard<std::mutex> cl(g_contourLock);
     auto restore = [&] {
         if (cs.contourIdx < cs.sets.size() && cs.sets[cs.contourIdx].set && cs.sets[cs.contourIdx].layout) {
             const BoundSet& bs = cs.sets[cs.contourIdx];
@@ -4133,7 +4144,7 @@ void ContourSync(DeviceData* d, VkCommandBuffer cb, CmdState& cs) {
         }
         cs.contourBound = false;
     };
-    if (!want || !g_dlss.contourWritten) {
+    if (!want || !g_contourWritten) {
         if (cs.contourBound) restore();
         return;
     }
@@ -4156,7 +4167,8 @@ void ContourSync(DeviceData* d, VkCommandBuffer cb, CmdState& cs) {
     if (!g_contour.loggedFirst) {
         g_contour.loggedFirst = true;
         Log("[contour] frame %llu: terrain pipeline %s reads colorMapDepthTex (set %u binding %u); giving it the "
-            "un-jittered depth", (unsigned long long)g_frame, H(cs.pipeline).c_str(), si, cs.pipe->contourBinding);
+            "un-jittered depth", (unsigned long long)g_hot.frame.load(), H(cs.pipeline).c_str(), si,
+            cs.pipe->contourBinding);
     }
 }
 
@@ -5622,8 +5634,11 @@ static VKAPI_ATTR void VKAPI_CALL tf3_CmdBindPipeline(VkCommandBuffer cb, VkPipe
     DeviceData* d = GetDevice(Key(cb));
     d->CmdBindPipeline(cb, bp, pipeline);
     if (bp == VK_PIPELINE_BIND_POINT_GRAPHICS) {
-        PerfScope ps(kPerfState);
-        ContourSync(d, cb, CmdFor(cb));
+        auto& cs = CmdFor(cb);
+        if (ContourWanted(cs) || cs.contourBound) {
+            PerfScope ps(kPerfState);
+            ContourSync(d, cb, cs);
+        }
     }
 }
 
@@ -5631,9 +5646,11 @@ static VKAPI_ATTR void VKAPI_CALL tf3_CmdBindDescriptorSets(VkCommandBuffer cb, 
                                                             VkPipelineLayout layout, uint32_t firstSet, uint32_t count,
                                                             const VkDescriptorSet* sets, uint32_t dynCount,
                                                             const uint32_t* dynOffsets) {
+    CmdState* csp = nullptr;
     if (bp == VK_PIPELINE_BIND_POINT_GRAPHICS) {
         PerfScope ps(kPerfBind);
         auto& cs = CmdFor(cb);
+        csp = &cs;
         if (cs.sets.size() < firstSet + count) cs.sets.resize(firstSet + count);
         ++cs.setsGen;
         uint32_t di = 0;  // dynamic offsets are consumed in set order, then binding order
@@ -5661,8 +5678,8 @@ static VKAPI_ATTR void VKAPI_CALL tf3_CmdBindDescriptorSets(VkCommandBuffer cb, 
     }
     DeviceData* d = GetDevice(Key(cb));
     d->CmdBindDescriptorSets(cb, bp, layout, firstSet, count, sets, dynCount, dynOffsets);
-    if (bp == VK_PIPELINE_BIND_POINT_GRAPHICS) {
-        auto& cs = CmdFor(cb);
+    if (csp) {
+        auto& cs = *csp;
         if (cs.contourBound && cs.contourIdx >= firstSet && cs.contourIdx < firstSet + count)
             cs.contourBound = false;  // the game's bind replaced ours
         if (cs.pipe && cs.pipe->contourSet >= (int)firstSet && cs.pipe->contourSet < (int)(firstSet + count)) {
@@ -6017,9 +6034,11 @@ void UpdateHot() {
     g_hot.jitterScreen.store(g_cfg.jitterScreenPasses != 0, std::memory_order_relaxed);
     g_hot.jitterOther.store(g_cfg.jitterOtherTargets != 0, std::memory_order_relaxed);
     g_hot.contour.store(ContourOn(), std::memory_order_relaxed);
-    if (LogFrame(g_frame) && g_contour.swaps) {
-        Log("[contour] frame %llu: the un-jittered depth was bound for terrain draws %llu times since the last report",
-            (unsigned long long)g_frame, (unsigned long long)g_contour.swaps);
+    if (LogFrame(g_frame)) {
+        std::lock_guard<std::mutex> cl(g_contourLock);
+        if (g_contour.swaps)
+            Log("[contour] frame %llu: the un-jittered depth was bound for terrain draws %llu times since the last "
+                "report", (unsigned long long)g_frame, (unsigned long long)g_contour.swaps);
         g_contour.swaps = 0;
     }
     g_hot.inW.store(g_dlss.inW, std::memory_order_relaxed);
