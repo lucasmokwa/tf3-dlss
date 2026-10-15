@@ -494,9 +494,7 @@ struct InstanceData {
     X(DestroyQueryPool)            \
     X(CmdResetQueryPool)           \
     X(CmdWriteTimestamp)           \
-    X(GetQueryPoolResults)         \
-    X(CmdDrawIndirect)             \
-    X(CmdDrawIndexedIndirect)
+    X(GetQueryPoolResults)
 
 struct DeviceData {
     VkDevice device = VK_NULL_HANDLE;
@@ -644,7 +642,6 @@ struct ObjDraw {
     int32_t vertexOffset = 0;
     uint64_t mesh = 0;
     uint32_t dst = 0;               // first entry in our previous-matrix buffer (assigned when recorded)
-    uint32_t cmd = 0;               // its draw command in our indirect buffer (assigned when recorded)
 };
 struct ObjProbe {
     VkBuffer buf = VK_NULL_HANDLE;
@@ -1208,10 +1205,6 @@ struct Dlss {
     std::map<std::string, VkPipeline> objPipelines;  // keyed by vertex layout
     VkBuffer objBuf = VK_NULL_HANDLE;  // previous-frame model matrices, kObjSlots x kObjMax x 64 bytes
     char* objPtr = nullptr;
-    // the object pass's draw commands, kObjSlots x kObjMax: written at submit, with no instances for
-    // a draw none of whose instances moved (most of them: parked and waiting vehicles)
-    VkBuffer objIndBuf = VK_NULL_HANDLE;
-    char* objIndPtr = nullptr;
     uint64_t objCounter = 0;
     std::vector<VkDeviceMemory> memories;
 } g_dlss;
@@ -2453,7 +2446,7 @@ struct ObjFrame {
 std::unordered_map<uint64_t, std::vector<std::array<float, 16>>> g_objPrev;  // mesh -> last frame's matrices
 uint64_t g_objPrevFrame = UINT64_MAX;
 struct ObjStats {
-    uint64_t frames = 0, draws = 0, drawn = 0, instances = 0, moved = 0, unmatched = 0;
+    uint64_t frames = 0, draws = 0, instances = 0, moved = 0, unmatched = 0;
 } g_objStats;
 
 std::string ObjLayoutKey(const PipeVtx& p) {
@@ -2467,7 +2460,6 @@ std::string ObjLayoutKey(const PipeVtx& p) {
 bool EnsureObjResources(DeviceData* d) {
     if (g_dlss.objFailed) return false;
     if (g_dlss.objRenderPass) return true;
-    if (!d->CmdDrawIndirect || !d->CmdDrawIndexedIndirect) return false;
     g_dlss.objFailed = true;  // cleared on success
     VkDescriptorSetLayoutBinding b[2] = {};
     b[0] = {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
@@ -2498,11 +2490,6 @@ bool EnsureObjResources(DeviceData* d) {
     if (!CreateBuffer(d, (VkDeviceSize)kObjSlots * kObjMax * 64, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &g_dlss.objBuf,
                       &g_dlss.objPtr))
-        return false;
-    if (!CreateBuffer(d, (VkDeviceSize)kObjSlots * kObjMax * sizeof(VkDrawIndexedIndirectCommand),
-                      VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
-                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &g_dlss.objIndBuf,
-                      &g_dlss.objIndPtr))
         return false;
     VkAttachmentDescription att{};
     att.format = VK_FORMAT_R16G16_SFLOAT;
@@ -2756,22 +2743,14 @@ bool RecordObjectPass(DeviceData* d, VkCommandBuffer cb, CmdState& cs, VkImageVi
         }
         od.dst = next;
         next += od.instances;
-        od.cmd = (uint32_t)cs.objDraws.size();
         VkBuffer bufs[3] = {od.posBuf, od.mdlBuf, g_dlss.objBuf};
         VkDeviceSize offs[3] = {od.posOff, od.mdlOff, ((VkDeviceSize)slot * kObjMax + od.dst) * 64};
         d->CmdBindVertexBuffers(cb, 0, 3, bufs, offs);
-        // Indirect, so that ObjFillPrev can drop the draw at submit if none of its instances moved. Until
-        // then it draws nothing, also if this command buffer is never submitted.
-        VkDeviceSize cmdOff = ((VkDeviceSize)slot * kObjMax + od.cmd) * sizeof(VkDrawIndexedIndirectCommand);
-        auto* ic = reinterpret_cast<VkDrawIndexedIndirectCommand*>(g_dlss.objIndPtr + cmdOff);
         if (od.indexed) {
-            *ic = {od.count, 0, od.first, od.vertexOffset, 0};
             d->CmdBindIndexBuffer(cb, od.ib, od.ibOff, od.ibType);
-            d->CmdDrawIndexedIndirect(cb, g_dlss.objIndBuf, cmdOff, 1, sizeof(VkDrawIndexedIndirectCommand));
-        } else {
-            *reinterpret_cast<VkDrawIndirectCommand*>(ic) = {od.count, 0, od.first, 0};
-            d->CmdDrawIndirect(cb, g_dlss.objIndBuf, cmdOff, 1, sizeof(VkDrawIndexedIndirectCommand));
-        }
+            d->CmdDrawIndexed(cb, od.count, od.instances, od.first, od.vertexOffset, 0);
+        } else
+            d->CmdDraw(cb, od.count, od.instances, od.first, 0);
         cs.objDraws.push_back(od);
     }
     d->CmdEndRenderPass(cb);
@@ -2802,12 +2781,10 @@ void ObjFillPrev(CmdState& cs) {
     if (havePrev)
         for (const auto& [mesh, list] : g_objPrev)
             for (const auto& m : list) exact.emplace(exactKey(mesh, m.data()), m.data());
-    uint64_t drawn = 0;
     for (const ObjDraw& od : cs.objDraws) {
         char* src = RefData(od.mdlBuf, od.mdlOff);
         auto& list = next[od.mesh];
         auto pp = havePrev ? g_objPrev.find(od.mesh) : g_objPrev.end();
-        bool anyMoved = false;
         for (uint32_t i = 0; i < od.instances; ++i) {
             float cur[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
             if (src)
@@ -2825,35 +2802,25 @@ void ObjFillPrev(CmdState& cs) {
                 }
             }
             if (prev == cur) ++unmatched;
-            else if (std::memcmp(prev, cur, 64) != 0) ++moved, anyMoved = true;
+            else if (std::memcmp(prev, cur, 64) != 0) ++moved;
             std::memcpy(base + (size_t)(od.dst + i) * 64, prev, 64);
             std::array<float, 16> a;
             std::memcpy(a.data(), cur, 64);
             list.push_back(a);
             ++total;
         }
-        // Only draws with a moving instance: for the others, the camera pass already has the full motion.
-        // (object_mv.vert drops the instances that didn't move in the draws that remain.)
-        if (anyMoved) {
-            auto* ic = reinterpret_cast<VkDrawIndexedIndirectCommand*>(
-                g_dlss.objIndPtr + ((size_t)cs.objSlot * kObjMax + od.cmd) * sizeof(VkDrawIndexedIndirectCommand));
-            ic->instanceCount = od.instances;  // the same field in VkDrawIndirectCommand
-            ++drawn;
-        }
     }
     g_objPrev = std::move(next);
     g_objPrevFrame = g_frame;
     ++g_objStats.frames;
     g_objStats.draws += cs.objDraws.size();
-    g_objStats.drawn += drawn;
     g_objStats.instances += total;
     g_objStats.moved += moved;
     g_objStats.unmatched += unmatched;
     if (LogFrame(g_frame))
-        Log("[obj] frame %llu: %zu draws (%llu with moving instances drawn), %llu instances of %zu moving "
-            "meshes; %llu moved, %llu unmatched (totals: %llu frames, %llu instances, %llu moved)",
-            (unsigned long long)g_frame, cs.objDraws.size(), (unsigned long long)drawn, (unsigned long long)total,
-            g_movingMeshes.size(),
+        Log("[obj] frame %llu: %zu draws, %llu instances of %zu moving meshes; %llu moved, %llu unmatched "
+            "(totals: %llu frames, %llu instances, %llu moved)",
+            (unsigned long long)g_frame, cs.objDraws.size(), (unsigned long long)total, g_movingMeshes.size(),
             (unsigned long long)moved, (unsigned long long)unmatched, (unsigned long long)g_objStats.frames,
             (unsigned long long)g_objStats.instances, (unsigned long long)g_objStats.moved);
 }
@@ -3098,9 +3065,9 @@ void DestroyFsr(DeviceData* d) {
 // the start of ours. A ring of kGpuSlots frames: a slot's results are read back, without waiting,
 // just before it is reused; the GPU finished that frame long before.
 constexpr uint32_t kGpuSlots = 8;
-enum GpuMarkId { kGmGameFsr, kGmStart, kGmCameraMv, kGmMotion, kGmUpscaler, kGmSharpen, kGmEnd, kGmCount };
+enum GpuMarkId { kGmGameFsr, kGmStart, kGmMotion, kGmUpscaler, kGmSharpen, kGmEnd, kGmCount };
 constexpr uint32_t kGpuParts = kGmEnd - kGmStart;  // the intervals between kGmStart .. kGmEnd
-const char* const kGpuPartNames[kGpuParts] = {"camera motion", "object motion", "upscaler", "sharpening",
+const char* const kGpuPartNames[kGpuParts] = {"motion vectors", "upscaler", "sharpening",
                                               "info box, debug view, barriers"};
 struct GpuPerf {
     VkQueryPool pool = VK_NULL_HANDLE;
@@ -3292,7 +3259,7 @@ void PerfPresent() {
         g_pw.scopeTicks * scopes / tpm / n, (double)waits / n,
         (double)g_perf.lockWaitTicks.load(std::memory_order_relaxed) / tpm / n);
     double gpuMs = g_gpu.frames ? g_gpu.totalMs / (double)g_gpu.frames : 0.0;
-    double upMs = g_gpu.frames ? g_gpu.partMs[kGmMotion - kGmStart] / (double)g_gpu.frames : 0.0;
+    double upMs = g_gpu.frames ? g_gpu.partMs[1] / (double)g_gpu.frames : 0.0;
     if (g_gpu.frames) {
         std::string gp;
         for (uint32_t i = 0; i < kGpuParts; ++i) {
@@ -3774,7 +3741,6 @@ void RecordUpscale(DeviceData* d, VkCommandBuffer cb, CmdState& cs) {
         copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         copy.imageExtent = {ci.w, ci.h, 1};
         d->CmdCopyBufferToImage(cb, g_dlss.mvBuffer, g_dlss.mvImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
-        GpuMark(d, cb, kGmCameraMv);
         if (g_cfg.motionVectors && RecordObjectPass(d, cb, cs, depthView, dyn))
             Barrier(d, cb, g_dlss.mvImage, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, RO);
         else
@@ -3805,7 +3771,6 @@ void RecordUpscale(DeviceData* d, VkCommandBuffer cb, CmdState& cs) {
         Barrier(d, cb, g_dlss.mvImage, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, RO);
         g_dlss.mvLayout = RO;
     }
-    GpuMark(d, cb, kGmCameraMv);  // no-op after the camera pass; otherwise both parts are 0
     GpuMark(d, cb, kGmMotion);
     Barrier(d, cb, g_dlss.outImage, VK_IMAGE_ASPECT_COLOR_BIT, g_dlss.outLayout, VK_IMAGE_LAYOUT_GENERAL);
 
