@@ -83,6 +83,9 @@ jobs:
           cmake --build build/harness
       - name: Run
         run: harness/run.sh build/harness logs/harness
+      - name: Summary (checks and the layer's cost, on the run's page)
+        if: always()
+        run: '[ -f logs/harness/summary.md ] && cat logs/harness/summary.md >> "$GITHUB_STEP_SUMMARY" || true'
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -91,6 +94,7 @@ jobs:
             logs/harness/**/fake_tf3.txt
             logs/harness/**/result.json
             logs/harness/**/tf3_dlss.log
+            logs/harness/summary.md
 
   build:
     needs: [version, harness]

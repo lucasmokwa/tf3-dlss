@@ -10,6 +10,7 @@
 #   skip_fsr   the same with skip_game_fsr=1
 #   perf       without validation, perf=1: the layer's [perf] report
 #   no_layer   fake_tf3 alone, to compare its CPU time per frame with "perf"
+# OUT_DIR/summary.md: the checks and the layer's cost in Markdown (CI shows it on the run's page).
 # Exit code 0 only if every check passed.
 set -u
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -57,6 +58,7 @@ run no_layer "" "" --no-checks
 echo
 echo "CPU time per frame for recording, with and without the layer:"
 grep -h 'CPU time per frame' "$out/perf/fake_tf3.txt" "$out/no_layer/fake_tf3.txt"
+python3 "$here/summary.py" "$out" > "$out/summary.md" || echo "run.sh: summary.py failed" >&2
 echo
 [ $status -eq 0 ] && echo "harness: all runs passed" || echo "harness: FAILED (see above and $out)"
 exit $status
