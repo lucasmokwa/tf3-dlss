@@ -93,11 +93,14 @@ jobs:
         run: |
           id=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/release.yml/runs?branch=main&event=push&status=success&per_page=1" \
                --jq '.workflow_runs[0].id // empty' || true)
+          # builds of main from before the harness have no results: nothing to compare with
+          if [ -n "$id" ] && [ "$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$id/artifacts?name=harness-results" \
+               --jq '.total_count' || echo 0)" = 0 ]; then id=""; fi
           echo "run_id=$id" >> "$GITHUB_OUTPUT"
           echo "latest main build: ${id:-none}"
       - name: Get its harness results
         if: always() && steps.main.outputs.run_id != ''
-        continue-on-error: true  # builds of main from before the harness have none
+        continue-on-error: true  # expired results: the summary then has nothing to compare with
         uses: actions/download-artifact@v4
         with:
           name: harness-results
