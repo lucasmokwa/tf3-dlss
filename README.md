@@ -112,6 +112,12 @@ still in the same scene and change one cfg line at a time (most apply live), or 
 upscaler with Ctrl+Shift+D (`debug_keys=1`): with it off the report shows what the layer's tracking
 alone costs. `skip_game_fsr=1` leaves out the game's FSR 1 draws while an upscaler runs.
 
+If the game stops with "Device lost error: there was a problem with the graphic card", the log ends
+with `[gpu-crash]` lines when `gpu_crash_info=1` (off by default; restart after changing): the last step each GPU queue started and
+finished, from markers between the mod's passes and at the start of the game's command buffers, and
+the driver's description of the fault where it gives one. That tells a crash in the mod's passes
+from one in the game's own work.
+
 ## Testing without the game
 
 `harness/fake_tf3` is a small Vulkan program that renders frames shaped like TF3's (3D scene with
