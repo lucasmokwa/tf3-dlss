@@ -17,6 +17,8 @@
 //   * every recorded frame's motion vectors, camera only and with the object pass, match the
 //     analytic motion of the wall and the cube to within 0.02 px (this includes "zero while
 //     still", which only holds if the jitter is taken out correctly),
+//   * the layer gives the scene shader that reads colorMapDepthTex (TF3's terrain contour lines) its
+//     un-jittered depth in place of the game's depth copy,
 //   * no validation errors (with --validation and the Khronos validation layer enabled),
 // and reports its own CPU time per frame for recording, which the layer's hooks add to.
 //
@@ -852,8 +854,14 @@ int main(int argc, char** argv) {
     const VkImageUsageFlags kTarget = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
     Image hdr = MakeImage(g.render.width, g.render.height, kHdr, kTarget, VK_IMAGE_ASPECT_COLOR_BIT);
     Image ldr = MakeImage(g.render.width, g.render.height, kHdr, kTarget, VK_IMAGE_ASPECT_COLOR_BIT);
-    Image depth = MakeImage(g.render.width, g.render.height, g.depthFmt, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+    Image depth = MakeImage(g.render.width, g.render.height, g.depthFmt,
+                            VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
                             VK_IMAGE_ASPECT_DEPTH_BIT);  // the layer adds SAMPLED
+    // TF3's colorMapDepthTex: a copy of the scene depth, read by next frame's terrain (contour lines)
+    Image contourDepth = MakeImage(g.render.width, g.render.height, g.depthFmt,
+                                   VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                                   VK_IMAGE_ASPECT_DEPTH_BIT);
+    bool contourDepthReady = false;  // moved out of its initial (undefined) layout
     Image easu = MakeImage(g.out.width, g.out.height, kPost, kTarget, VK_IMAGE_ASPECT_COLOR_BIT);
     Image rcas = MakeImage(g.out.width, g.out.height, kPost, kTarget, VK_IMAGE_ASPECT_COLOR_BIT);
     // (the depth view isn't used by the app; TF3's own depth view has both aspects)
@@ -875,7 +883,9 @@ int main(int argc, char** argv) {
     auto bind = [](uint32_t b, VkDescriptorType t, VkShaderStageFlags s) {
         return VkDescriptorSetLayoutBinding{b, t, 1, s, nullptr};
     };
-    VkDescriptorSetLayout dslView = SetLayout({bind(10, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_SHADER_STAGE_VERTEX_BIT)});
+    VkDescriptorSetLayout dslView = SetLayout({bind(10, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_SHADER_STAGE_VERTEX_BIT),
+                                               bind(16, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                                                    VK_SHADER_STAGE_FRAGMENT_BIT)});
     VkDescriptorSetLayout dslMat =
         SetLayout({bind(0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, VK_SHADER_STAGE_FRAGMENT_BIT)});
     VkDescriptorSetLayout dslTex =
@@ -934,7 +944,15 @@ int main(int argc, char** argv) {
     {
         std::vector<VkWriteDescriptorSet> w;
         VkDescriptorBufferInfo vbi[kInFlight];
+        VkDescriptorImageInfo cdi{sampler, contourDepth.view, RO};
         for (uint32_t i = 0; i < kInFlight; ++i) {
+            VkWriteDescriptorSet c{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            c.dstSet = viewSet[i];
+            c.dstBinding = 16;
+            c.descriptorCount = 1;
+            c.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            c.pImageInfo = &cdi;
+            w.push_back(c);
             vbi[i] = {viewUbo[i].buf, 0, sizeof(ViewUbo)};
             VkWriteDescriptorSet x{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
             x.dstSet = viewSet[i];
@@ -1100,6 +1118,18 @@ int main(int argc, char** argv) {
         auto recordScene = [&](uint32_t part) {
             VkCommandBuffer cb = cmd[part][slot];
             VKC(vkBeginCommandBuffer(cb, &bi));
+            if (part == 0 && !contourDepthReady) {  // first frame: no copy yet, so nothing to show either
+                contourDepthReady = true;
+                VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+                b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+                b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+                b.newLayout = RO;
+                b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                b.image = contourDepth.image;
+                b.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, 0, 1, 0, 1};
+                vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0,
+                                     nullptr, 0, nullptr, 1, &b);
+            }
             begin(cb, part == 0 ? rpScene : rpSceneMore, fbScene, g.render);
             vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pScene);
             vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, plScene, 0, 1, &viewSet[slot], 0, nullptr);
@@ -1134,6 +1164,42 @@ int main(int argc, char** argv) {
         vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, plTonemap, 0, 2, tonemapSets, 0, nullptr);
         vkCmdDraw(cb, 3, 1, 0, 0);
         vkCmdEndRenderPass(cb);
+        // 2b. the depth copy that next frame's contour lines read (colorMapDepthTex)
+        {
+            const VkImageAspectFlags ds = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+            VkImageMemoryBarrier b[2] = {{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER}, {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER}};
+            b[0].srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+            b[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            b[0].oldLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+            b[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            b[0].image = depth.image;
+            b[1].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            b[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            b[1].oldLayout = RO;
+            b[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            b[1].image = contourDepth.image;
+            for (auto& x : b) {
+                x.srcQueueFamilyIndex = x.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                x.subresourceRange = {ds, 0, 1, 0, 1};
+            }
+            vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                                 VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 2, b);
+            VkImageCopy c{};
+            c.srcSubresource = c.dstSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
+            c.extent = {g.render.width, g.render.height, 1};
+            vkCmdCopyImage(cb, depth.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, contourDepth.image,
+                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
+            std::swap(b[0].oldLayout, b[0].newLayout);
+            b[0].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            b[0].dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_SHADER_READ_BIT;
+            std::swap(b[1].oldLayout, b[1].newLayout);
+            b[1].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            b[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                 VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                 0, 0, nullptr, 0, nullptr, 2, b);
+        }
         // 3. FSR 1 EASU and RCAS stand-ins (magenta)
         begin(cb, rpPost, fbEasu, g.out);
         vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pEasu);
@@ -1252,6 +1318,11 @@ int main(int argc, char** argv) {
                  100.0 * magenta / npx);
         AddCheck("image has content", stddev > 20, "brightness spread %.1f (a flat image means nothing was drawn)", stddev);
         AddCheck("UI on top", uiLum > 200, "UI panel brightness %.0f (should be about 230)", uiLum);
+        bool contour = log.find("giving it the un-jittered depth") != std::string::npos &&
+                       log.find("the un-jittered depth was bound for terrain draws") != std::string::npos;
+        AddCheck("contour lines get un-jittered depth", contour,
+                 contour ? "the log says the colorMapDepthTex draws were given the layer's un-jittered depth"
+                         : "the log never says the colorMapDepthTex draws got the un-jittered depth");
         std::vector<fs::path> caps;
         for (auto& e : fs::directory_iterator(g_opt.out / "mvcap", ec))
             if (e.path().extension() == ".json") caps.push_back(e.path());
