@@ -96,6 +96,22 @@ installed in the game folder steps aside for it: its `version.dll` sees the laye
 `run_validation.ps1` does the same with the Khronos validation layer below ours
 (`-Sync` adds synchronisation validation); messages go to `logs\validation.log`.
 
+## Measuring the mod's cost
+
+Set `perf=1` in `tf3_dlss.cfg` (live) and every `perf_seconds` the log gets a `[perf]` report:
+
+- frame time (average and slowest 1%) and which upscaler ran,
+- the CPU time of the layer's own code per frame, by kind of call (draws, descriptor binds, render
+  passes, recording the upscaler, ...), with calls per frame and how often game threads waited for
+  the layer's lock,
+- GPU time of each pass the layer adds (motion vectors, DLSS/FSR, sharpening, the rest), from
+  timestamp queries, and of the game's own FSR 1 passes that the upscaler makes redundant.
+
+With `overlay=1` the info box's last line shows the totals. To compare settings, keep the camera
+still in the same scene and change one cfg line at a time (most apply live), or toggle the
+upscaler with Ctrl+Shift+D (`debug_keys=1`): with it off the report shows what the layer's tracking
+alone costs. `skip_game_fsr=1` leaves out the game's FSR 1 draws while an upscaler runs.
+
 ## Releasing
 
 Every push to `main` is released by GitHub Actions (`.github/workflows/release.yml`), as the next
