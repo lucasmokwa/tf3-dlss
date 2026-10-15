@@ -7,7 +7,8 @@
 // isn't swapped into the blit, the screen is magenta.
 //
 // The scene is a flat checkerboard wall facing the camera and a cube sliding sideways in front of
-// it. The camera stands still, then pans sideways, then up, so the motion vectors the layer
+// it, with a second, parked copy of the cube above it in the same draw (the layer leaves out the
+// copies that don't move). The camera stands still, then pans sideways, then up, so the motion vectors the layer
 // records (TF3_DLSS_CAPTURE) can be checked against exact values.
 //
 // After the run it checks (exit code 0 = all passed, 1 = a check failed, 2 = it couldn't run):
@@ -94,6 +95,7 @@ constexpr float kNear = 1.f, kFar = 5000.f, kFovY = 1.0471976f;  // 60 degrees
 constexpr float kWallZ = -20.f;    // the wall faces the camera at this depth
 constexpr float kCubeZ = -12.f;    // cube centre; its front face is at view depth 11
 constexpr float kPanSpeed = 0.05f, kCubeSpeed = 0.04f;
+constexpr float kParkedX = 2.f, kParkedY = 4.f;  // the parked cube (the moving one stays within y -1..1)
 float CamX(uint32_t f) { return kPanSpeed * (float)std::clamp<int>((int)f - 100, 0, 80); }   // pans right on 100..180
 float CamY(uint32_t f) { return kPanSpeed * (float)std::clamp<int>((int)f - 180, 0, 80); }   // pans up on 180..260
 float CubeX(uint32_t f) {  // slides back and forth between -5 and 5, turning at frames 250, 500, ...
@@ -771,7 +773,7 @@ void CheckCapture(const fs::path& json, const Mat4& proj) {
         z[i] = 2.f * kNear * kFar / (kFar + kNear - zn * (kFar - kNear));
     }
     // Inside a surface only: all four neighbours (2 render pixels away) at the same depth.
-    size_t wall = 0, cube = 0, bad = 0, badCam = 0;
+    size_t wall = 0, cube = 0, parked = 0, bad = 0, badCam = 0;
     double worst = 0, worstCam = 0;
     float cubeLimit = (float)(-kWallZ - kCubeZ) / 2 + 0.5f;  // between the cube front (11) and the wall (20)
     for (uint32_t y = 1; y + 1 < h; ++y)
@@ -783,9 +785,12 @@ void CheckCapture(const fs::path& json, const Mat4& proj) {
                 continue;
             bool isCube = zc < cubeLimit;
             if (!isCube && std::fabs(zc + kWallZ) > 0.01f) continue;  // background (nothing drawn)
-            (isCube ? cube : wall)++;
+            // the parked cube: above the moving one (world y from the pixel row and its depth)
+            double ndcY = 1.0 - 2.0 * (y + 0.5) / h;
+            bool isParked = isCube && ndcY * zc / proj.m[5] + CamY(frame) > 2.0;
+            (isParked ? parked : isCube ? cube : wall)++;
             double camX = sx * camDx / zc, camY = -sy * camDy / zc;
-            double fullX = sx * (camDx - (isCube ? cubeDx : 0.f)) / zc;
+            double fullX = sx * (camDx - (isCube && !isParked ? cubeDx : 0.f)) / zc;
             auto err = [](uint32_t packed, double ex, double ey) {
                 double gx = HalfToFloat((uint16_t)(packed & 0xFFFF)), gy = HalfToFloat((uint16_t)(packed >> 16));
                 return std::max(std::fabs(gx - ex), std::fabs(gy - ey));
@@ -797,14 +802,14 @@ void CheckCapture(const fs::path& json, const Mat4& proj) {
             if (e > tol) ++bad;
             if (ec > tol) ++badCam;
         }
-    size_t total = wall + cube;
-    bool enough = wall > (size_t)w * h / 4 && cube > 200;
+    size_t total = wall + cube + parked;
+    bool enough = wall > (size_t)w * h / 4 && cube > 200 && parked > 200;
     bool ok = enough && bad <= total / 200 && badCam <= total / 200;
     AddCheck(name, ok,
-             "camera moved (%.3f, %.3f), cube %.3f per frame; %zu wall + %zu cube pixels checked; off by more than "
-             "0.02 px: %zu with objects (worst %.3f px), %zu camera only (worst %.3f px)%s",
-             camDx, camDy, cubeDx, wall, cube, bad, worst, badCam, worstCam,
-             enough ? "" : "; too few pixels of the wall or the cube were found");
+             "camera moved (%.3f, %.3f), cube %.3f per frame; %zu wall + %zu cube + %zu parked cube pixels checked; "
+             "off by more than 0.02 px: %zu with objects (worst %.3f px), %zu camera only (worst %.3f px)%s",
+             camDx, camDy, cubeDx, wall, cube, parked, bad, worst, badCam, worstCam,
+             enough ? "" : "; too few pixels of the wall or the cubes were found");
 }
 
 }  // namespace
@@ -838,7 +843,7 @@ int main(int argc, char** argv) {
     CreateInstanceAndSurface();
     CreateDevice();
     CreateSwapchain();
-    std::printf("fake_tf3: %s, render %ux%u -> output %ux%u, %u wall draws + 1 cube on %u threads, %u frames\n",
+    std::printf("fake_tf3: %s, render %ux%u -> output %ux%u, %u wall draws + 1 draw of 2 cubes on %u threads, %u frames\n",
                 g.props.deviceName, g.render.width, g.render.height, g.out.width, g.out.height,
                 g_opt.tilesX * g_opt.tilesY, g_opt.threads, g_opt.frames);
 
@@ -911,7 +916,7 @@ int main(int argc, char** argv) {
     VkDescriptorSet viewSet[kInFlight];
     for (uint32_t i = 0; i < kInFlight; ++i) {
         viewUbo[i] = MakeBuffer(sizeof(ViewUbo), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
-        inst[i] = MakeBuffer((VkDeviceSize)(tiles + 1) * 64, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+        inst[i] = MakeBuffer((VkDeviceSize)(tiles + 2) * 64, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
         viewSet[i] = alloc(dslView);
     }
     Buffer mat = MakeBuffer(kMaterials * kMatStride, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
@@ -1069,6 +1074,7 @@ int main(int argc, char** argv) {
                 im[ty * g_opt.tilesX + tx] = Mul(Translate(-wallW / 2 + (tx + .5f) * tileW, -wallH / 2 + (ty + .5f) * tileH, kWallZ),
                                                  Scale(tileW, tileH, 1.f));
         im[tiles] = Translate(CubeX(f), 0.f, kCubeZ);
+        im[tiles + 1] = Translate(kParkedX, kParkedY, kCubeZ);
 
         auto t0 = std::chrono::steady_clock::now();
         VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
@@ -1111,7 +1117,7 @@ int main(int argc, char** argv) {
                 vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, plScene, 1, 1, &matSet, 1, &cubeOff);
                 vkCmdBindVertexBuffers(cb, 0, 1, &cubeVb.buf, &zero);
                 vkCmdBindIndexBuffer(cb, cubeIb.buf, 0, VK_INDEX_TYPE_UINT16);
-                vkCmdDrawIndexed(cb, 36, 1, 0, 0, tiles);
+                vkCmdDrawIndexed(cb, 36, 2, 0, 0, tiles);  // the moving cube and the parked one
             }
             vkCmdEndRenderPass(cb);
             VKC(vkEndCommandBuffer(cb));
