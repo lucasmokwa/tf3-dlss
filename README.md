@@ -136,7 +136,8 @@ Results go to `logs\harness`. CI runs the same checks on Linux before every buil
 there the layer is built as a shared library with NGX stubbed out (`harness/ngx_stub.cpp`), on Mesa's
 CPU Vulkan driver, and `TF3_DLSS_TEST_UPSCALER=1` swaps DLSS and FSR for a bilinear resize. A failing
 check stops the build, so nothing is released. Each CI run's summary page shows the checks and what the layer costs
-(CPU time per frame with and without it, its own `[perf]` report and lock waits), from `harness/summary.py`.
+(CPU time per frame with and without it, its own `[perf]` report and lock waits), from `harness/summary.py`,
+next to the numbers of the latest build of `main` and the change.
 
 ## Releasing
 

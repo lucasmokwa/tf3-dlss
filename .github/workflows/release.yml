@@ -16,6 +16,7 @@ on:
 
 permissions:
   contents: write
+  actions: read  # the harness job reads the latest main build's results
 
 concurrency:
   group: release-${{ github.ref }}
@@ -83,9 +84,31 @@ jobs:
           cmake --build build/harness
       - name: Run
         run: harness/run.sh build/harness logs/harness
-      - name: Summary (checks and the layer's cost, on the run's page)
+      # The latest successful build of main, for its metrics.json: the cost tables show the change.
+      - name: Find the latest main build
+        id: main
         if: always()
-        run: '[ -f logs/harness/summary.md ] && cat logs/harness/summary.md >> "$GITHUB_STEP_SUMMARY" || true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          id=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/release.yml/runs?branch=main&event=push&status=success&per_page=1" \
+               --jq '.workflow_runs[0].id // empty' || true)
+          echo "run_id=$id" >> "$GITHUB_OUTPUT"
+          echo "latest main build: ${id:-none}"
+      - name: Get its harness results
+        if: always() && steps.main.outputs.run_id != ''
+        continue-on-error: true  # builds of main from before the harness have none
+        uses: actions/download-artifact@v4
+        with:
+          name: harness-results
+          path: _main
+          run-id: ${{ steps.main.outputs.run_id }}
+          github-token: ${{ github.token }}
+      - name: Summary (checks and the layer's cost against main, on the run's page)
+        if: always()
+        run: |
+          python3 harness/summary.py logs/harness _main/metrics.json > logs/harness/summary.md || exit 0
+          cat logs/harness/summary.md >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -95,6 +118,7 @@ jobs:
             logs/harness/**/result.json
             logs/harness/**/tf3_dlss.log
             logs/harness/summary.md
+            logs/harness/metrics.json
 
   build:
     needs: [version, harness]

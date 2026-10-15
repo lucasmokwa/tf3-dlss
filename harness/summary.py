@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Writes a Markdown summary of a harness/run.sh run: the checks, and what the layer costs.
 
-    harness/summary.py OUT_DIR > summary.md
+    harness/summary.py OUT_DIR [BASELINE_METRICS_JSON] > summary.md
 
-Reads OUT_DIR/<run>/result.json (fake_tf3) and the last [perf] report in OUT_DIR/perf/tf3_dlss.log.
-CI appends it to the run's summary page. The numbers are from Mesa's CPU driver (lavapipe) on a CI
-runner: compare them between runs, not with a real GPU.
+Reads OUT_DIR/<run>/result.json (fake_tf3) and the last [perf] report in OUT_DIR/perf/tf3_dlss.log,
+and writes the cost numbers to OUT_DIR/metrics.json. With a metrics.json from an earlier run (CI
+passes the latest main build's), the cost tables get that run's numbers and the change next to them.
+The numbers are from Mesa's CPU driver (lavapipe) on a CI runner: compare them between runs, not
+with a real GPU, and expect a few percent of noise.
 """
 import json
 import re
@@ -13,6 +15,12 @@ import sys
 from pathlib import Path
 
 out = Path(sys.argv[1] if len(sys.argv) > 1 else "logs/harness")
+base = None
+if len(sys.argv) > 2:
+    try:
+        base = json.loads(Path(sys.argv[2]).read_text())
+    except (OSError, ValueError):
+        base = None
 
 
 def result(name):
@@ -32,14 +40,59 @@ def last_perf_report(log):
     return lines[starts[-1]:] if starts else []
 
 
-def ms(v):
-    return f"{v:.3f} ms" if isinstance(v, (int, float)) else "n/a"
+# ---- numbers
+perf, nolayer = result("perf"), result("no_layer")
+report = last_perf_report(out / "perf" / "tf3_dlss.log")
+m = {"record_ms": {}, "layer_ms": {}, "calls": {}, "lock": {}}
+if perf and nolayer:
+    m["record_ms"] = {"without the layer": nolayer.get("record_ms"), "with the layer": perf.get("record_ms")}
+    if all(isinstance(v, (int, float)) for v in m["record_ms"].values()):
+        m["record_ms"]["the layer adds"] = perf["record_ms"] - nolayer["record_ms"]
+for line in report:
+    r = re.search(r"layer CPU: ([\d.]+) ms per frame.*?\): (.*)", line)
+    if r:
+        m["layer_ms"]["all"] = float(r.group(1))
+        for part in r.group(2).split(", "):
+            p = re.match(r"(.+?) ([\d.]+) \((\d+) calls\)", part)
+            if p:
+                m["layer_ms"][p.group(1)] = float(p.group(2))
+                m["calls"][p.group(1)] = int(p.group(3))
+    r = re.search(r"waited for the layer's lock (\d+) times per frame, ([\d.]+) ms", line)
+    if r:
+        m["lock"] = {"waits per frame": int(r.group(1)), "ms waiting": float(r.group(2))}
+(out / "metrics.json").write_text(json.dumps(m, indent=2) + "\n")
 
 
-md = ["## Test harness", ""]
+def num(v, unit=" ms"):
+    if isinstance(v, int) and unit == "":
+        return str(v)
+    return f"{v:.3f}{unit}" if isinstance(v, (int, float)) else "n/a"
 
-# Checks
-md += ["| run | result |", "|---|---|"]
+
+def change(now, was):
+    if not isinstance(now, (int, float)) or not isinstance(was, (int, float)):
+        return ""
+    d = now - was
+    pct = f" ({d / was * 100:+.0f}%)" if was else ""
+    return (f"{d:+d}" if isinstance(d, int) else f"{d:+.3f}") + pct
+
+
+def table(title, section, unit=" ms", bold=()):
+    """A cost table: name, this run, and with a baseline: main and the change."""
+    rows = m[section]
+    if not rows:
+        return []
+    was = (base or {}).get(section, {})
+    head = f"| {title} | this run |" + (" main | change |" if base else "")
+    t = [head, "|---|---|" + ("---|---|" if base else "")]
+    for k, v in rows.items():
+        name, val = (f"**{k}**", f"**{num(v, unit)}**") if k in bold else (k, num(v, unit))
+        t.append(f"| {name} | {val} |" + (f" {num(was.get(k), unit)} | {change(v, was.get(k))} |" if base else ""))
+    return t + [""]
+
+
+# ---- Markdown
+md = ["## Test harness", "", "| run | result |", "|---|---|"]
 failed = []
 for name in ("checks", "skip_fsr", "perf"):
     r = result(name)
@@ -54,43 +107,21 @@ md.append("")
 if failed:
     md += ["Failed:", ""] + [f"- {f}" for f in failed] + [""]
 
-# Cost
-perf, base = result("perf"), result("no_layer")
 md += ["### What the layer costs", ""]
-if perf and base:
-    rec, rec0 = perf.get("record_ms"), base.get("record_ms")
-    md += [
-        f"fake_tf3: {perf.get('draws')} draws per frame recorded on several threads, "
-        f"{perf['render'][0]}x{perf['render'][1]} -> {perf['output'][0]}x{perf['output'][1]}, on {perf.get('gpu')}.",
-        "",
-        "| CPU time per frame, recording | |",
-        "|---|---|",
-        f"| without the layer | {ms(rec0)} |",
-        f"| with the layer | {ms(rec)} |",
-    ]
-    if isinstance(rec, (int, float)) and isinstance(rec0, (int, float)):
-        md.append(f"| **the layer adds** | **{ms(rec - rec0)}** |")
-    md.append("")
-
-report = last_perf_report(out / "perf" / "tf3_dlss.log")
-for line in report:
-    m = re.search(r"layer CPU: ([\d.]+) ms per frame.*?\): (.*)", line)
-    if m:
-        md += [f"Layer CPU (its own `[perf]` report): **{m.group(1)} ms per frame**", "",
-               "| kind of call | ms per frame | calls per frame |", "|---|---|---|"]
-        for part in m.group(2).split(", "):
-            p = re.match(r"(.+?) ([\d.]+) \((\d+) calls\)", part)
-            if p:
-                md.append(f"| {p.group(1)} | {p.group(2)} | {p.group(3)} |")
-        md.append("")
-    m = re.search(r"waited for the layer's lock (\d+) times per frame, ([\d.]+) ms", line)
-    if m:
-        md += [f"Lock waits: **{m.group(1)} per frame** ({m.group(2)} ms in all).", ""]
+if perf:
+    md += [f"fake_tf3: {perf.get('draws')} draws per frame recorded on several threads, "
+           f"{perf['render'][0]}x{perf['render'][1]} -> {perf['output'][0]}x{perf['output'][1]}, "
+           f"on {perf.get('gpu')}. "
+           + ("Compared with the latest build of main." if base else "No main build to compare with yet."), ""]
+md += table("CPU time per frame, recording", "record_ms", bold=("the layer adds",))
+md += table("layer CPU per frame (its `[perf]` report)", "layer_ms", bold=("all",))
+md += table("lock", "lock", unit="")
+if m["calls"]:
+    md += ["Calls per frame: " + ", ".join(f"{k} {v}" for k, v in m["calls"].items()) + ".", ""]
 if report:
     md += ["<details><summary>Full [perf] report</summary>", "", "```"] + report + ["```", "", "</details>", ""]
 else:
     md += ["No `[perf]` report in perf/tf3_dlss.log.", ""]
-
-md += ["CPU driver on a shared CI runner: compare these numbers between runs, not with a game on a GPU. "
-       "GPU times in the full report are CPU time on this driver."]
+md += ["CPU driver on a shared CI runner: compare these numbers between runs, not with a game on a GPU, "
+       "and expect a few percent of noise. GPU times in the full report are CPU time on this driver."]
 print("\n".join(md))
