@@ -29,7 +29,9 @@ env:
   # NVIDIA DLSS SDK tag (https://github.com/NVIDIA/DLSS/tags). Keep it the same as the local SDK.
   DLSS_SDK_REF: v310.9.1
   # Nexus Mods page https://www.nexusmods.com/transportfever3/mods/17 and its main file
-  # ("TF3 DLSS", file_id=51 in the Files tab download link). Each release becomes a new version of it.
+  # ("TF3 DLSS", file_id=51 in the Files tab download link). These are the site's per-game IDs;
+  # the nexus job looks up the API's own IDs from them. Each release becomes a new version of it.
+  NEXUS_GAME: transportfever3
   NEXUS_MOD_ID: '17'
   NEXUS_FILE_ID: '51'
 
@@ -237,14 +239,26 @@ jobs:
           cat changelog.txt
           { echo 'text<<EOF'; cat changelog.txt; echo EOF; } >> "$GITHUB_OUTPUT"
 
+      # The upload API takes its own mod and file IDs, not the numbers in the site's URLs.
+      - name: Look up the Nexus API IDs
+        id: ids
+        if: env.NEXUSMODS_API_KEY != ''
+        run: |
+          get() { curl -fsS -H "apikey: $NEXUSMODS_API_KEY" "https://api.nexusmods.com/v3/games/$NEXUS_GAME/$1"; }
+          mod=$(get "mods/$NEXUS_MOD_ID" | jq -er .data.id)
+          file=$(get "mod-file-versions/$NEXUS_FILE_ID" | jq -er .data.file.id)
+          echo "mod $NEXUS_MOD_ID -> $mod, file $NEXUS_FILE_ID -> $file"
+          echo "mod=$mod" >> "$GITHUB_OUTPUT"
+          echo "file=$file" >> "$GITHUB_OUTPUT"
+
       - name: Upload to Nexus Mods
         if: env.NEXUSMODS_API_KEY != ''
         # v1.0.0-beta.11, pinned by commit.
         uses: Nexus-Mods/upload-action@98532f7670c27cbecc78fae03fa3e278147827e2
         with:
           api_key: ${{ env.NEXUSMODS_API_KEY }}
-          mod_id: ${{ env.NEXUS_MOD_ID }}
-          file_id: ${{ env.NEXUS_FILE_ID }}
+          mod_id: ${{ steps.ids.outputs.mod }}
+          file_id: ${{ steps.ids.outputs.file }}
           filename: TF3-DLSS-${{ env.VER }}.zip
           version: ${{ env.VER }}
           display_name: TF3 DLSS
