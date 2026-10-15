@@ -5,6 +5,8 @@
 # The CI build stamps that version into its own copy of layer.cpp, the layer manifests and
 # package/README.txt; nothing is committed back. Pushes that only change Markdown files are skipped.
 # Pull requests get the same build, with the zip kept as a workflow artifact instead of a release.
+# After a release, the same zip goes to Nexus Mods as a new version of the main file (see the
+# nexus job); that step is skipped when the NEXUSMODS_API_KEY secret is not set.
 name: Build and release
 
 on:
@@ -26,6 +28,10 @@ env:
   VULKAN_SDK_VERSION: 1.4.363.0
   # NVIDIA DLSS SDK tag (https://github.com/NVIDIA/DLSS/tags). Keep it the same as the local SDK.
   DLSS_SDK_REF: v310.9.1
+  # Nexus Mods page https://www.nexusmods.com/transportfever3/mods/17 and its main file
+  # ("TF3 DLSS", file_id=51 in the Files tab download link). Each release becomes a new version of it.
+  NEXUS_MOD_ID: '17'
+  NEXUS_FILE_ID: '51'
 
 jobs:
   # Works out the version on a cheap Linux runner.
@@ -196,3 +202,54 @@ jobs:
           gh release create "v$env:VER" "dist\TF3-DLSS-$env:VER.zip" `
             --target $env:GITHUB_SHA --title "TF3-DLSS $env:VER" --generate-notes
           if ($LASTEXITCODE -ne 0) { throw "gh release create failed (exit $LASTEXITCODE)" }
+
+  # Uploads the released zip to Nexus Mods as a new version of the main file, archives the previous
+  # version and sets the mod page version. Re-run only this job if Nexus fails; the GitHub release
+  # is already out by then.
+  nexus:
+    needs: [version, build]
+    if: needs.version.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    env:
+      # API key from https://www.nexusmods.com/settings/api-keys, stored as a repository secret.
+      NEXUSMODS_API_KEY: ${{ secrets.NEXUSMODS_API_KEY }}
+      VER: ${{ needs.version.outputs.version }}
+    steps:
+      - name: Check for the Nexus API key
+        if: env.NEXUSMODS_API_KEY == ''
+        run: echo "::notice::NEXUSMODS_API_KEY secret is not set, skipping the Nexus Mods upload."
+
+      - uses: actions/download-artifact@v4
+        if: env.NEXUSMODS_API_KEY != ''
+        with:
+          name: TF3-DLSS-${{ env.VER }}
+
+      # Nexus changelog from the release notes: "* Title by @user in .../pull/9" -> "Title (#9)".
+      - name: Changelog from the GitHub release
+        id: notes
+        if: env.NEXUSMODS_API_KEY != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/v$VER" --jq .body \
+            | sed -n 's/^\* \(.*\) by @[^ ]* in .*\/pull\/\([0-9]*\).*$/\1 (#\2)/p' > changelog.txt
+          [ -s changelog.txt ] || echo "See https://github.com/$GITHUB_REPOSITORY/releases/tag/v$VER" > changelog.txt
+          cat changelog.txt
+          { echo 'text<<EOF'; cat changelog.txt; echo EOF; } >> "$GITHUB_OUTPUT"
+
+      - name: Upload to Nexus Mods
+        if: env.NEXUSMODS_API_KEY != ''
+        # v1.0.0-beta.11, pinned by commit.
+        uses: Nexus-Mods/upload-action@98532f7670c27cbecc78fae03fa3e278147827e2
+        with:
+          api_key: ${{ env.NEXUSMODS_API_KEY }}
+          mod_id: ${{ env.NEXUS_MOD_ID }}
+          file_id: ${{ env.NEXUS_FILE_ID }}
+          filename: TF3-DLSS-${{ env.VER }}.zip
+          version: ${{ env.VER }}
+          display_name: TF3 DLSS
+          description: TF3-DLSS ${{ env.VER }}. Release notes and source at https://github.com/${{ github.repository }}/releases/tag/v${{ env.VER }}
+          category: main
+          archive_existing_version: 'true'
+          update_mod_version: 'true'
+          changelog: ${{ steps.notes.outputs.text }}
