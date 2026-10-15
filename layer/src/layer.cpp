@@ -37,6 +37,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <atomic>
 #include <cmath>
 #include <cstdarg>
@@ -50,9 +51,11 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <set>
+#include <shared_mutex>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -649,9 +652,11 @@ struct ObjProbe {
     bool skinned = false;
 };
 
+struct PipeInfo;
 struct CmdState {
     Kind kind = Kind::Other;
     VkPipeline pipeline = VK_NULL_HANDLE;
+    const PipeInfo* pipe = nullptr;  // what the layer knows about `pipeline` (null: nothing)
     std::vector<BoundSet> sets;
     VkFramebuffer fb = VK_NULL_HANDLE;
     VkRenderPass rp = VK_NULL_HANDLE;
@@ -695,6 +700,11 @@ struct CmdState {
     // the blit search (OnDraw) only runs again when a descriptor set was bound since the last one
     uint32_t setsGen = 0, blitGen = UINT32_MAX;
     std::pair<int, int> blitHit{-1, -1};
+    uint32_t viewGen = UINT32_MAX;  // setsGen when the camera buffer was last looked for (CheckForView)
+    // the scene viewport seen in this command buffer, handed to g_dlss when its render pass ends
+    bool hasSceneVp = false;
+    VkViewport sceneVp{};
+    std::shared_ptr<const std::unordered_set<uint64_t>> moving;  // g_movingSnap when the pass began
 };
 
 // Render state of a pipeline, for the scene draw log (Ctrl+Shift+L).
@@ -718,6 +728,15 @@ struct PipeViewport {
 
 struct RenderPassInfo {
     std::vector<VkImageLayout> finalLayouts;
+};
+
+// What the draw hooks need to know about a pipeline; fixed once the pipeline is created.
+struct PipeInfo {
+    Kind kind = Kind::Other;
+    PipeViewport vp;
+    bool hasVtx = false;
+    PipeVtx vtx;
+    bool screenPass = false;  // no depth test: a full-screen pass (not jittered by default)
 };
 
 // Guards everything below. Recursive: the FSR runtime may record through the loader (and so
@@ -803,15 +822,72 @@ std::unordered_map<VkCommandBuffer, CmdState> g_cmd;  // entries are never erase
 
 // The state of a command buffer. A thread records into one command buffer at a time, so it keeps the
 // last one it looked up. Caller holds g_t.
+// A command buffer is recorded by one thread at a time, so its CmdState needs no lock while it is being
+// recorded; only finding it in g_cmd does (on a miss of this thread's small cache).
 CmdState& CmdFor(VkCommandBuffer cb) {
-    thread_local VkCommandBuffer lastCb = VK_NULL_HANDLE;
-    thread_local CmdState* last = nullptr;
-    if (cb != lastCb || !last) {
-        last = &g_cmd[cb];
-        lastCb = cb;
+    thread_local VkCommandBuffer cbs[4] = {};
+    thread_local CmdState* states[4] = {};
+    thread_local uint32_t next = 0;
+    for (uint32_t i = 0; i < 4; ++i)
+        if (cbs[i] == cb && states[i]) return *states[i];
+    CmdState* s;
+    {
+        TLock lk(g_t);
+        s = &g_cmd[cb];
     }
-    return *last;
+    cbs[next] = cb;
+    states[next] = s;
+    next = (next + 1) % 4;
+    return *s;
 }
+
+// ---- Read by the per-command hooks without g_t ---------------------------------------------------
+// The game records a frame on several threads. Taking g_t in every draw, bind and state call made those
+// threads queue behind each other (thousands of waits per frame, several ms). Those hooks now work on
+// their own command buffer's state, on the pipeline information below and on per-frame values that are
+// written under g_t (at present) and read here as atomics; they take g_t only for the few draws that
+// need more: the passes the layer replaces, moving objects, the first draws looking for the camera.
+std::shared_mutex g_pipeInfoLock;  // guards g_pipeInfo (written under g_t as well)
+std::unordered_map<VkPipeline, std::unique_ptr<PipeInfo>> g_pipeInfo;
+std::atomic<uint32_t> g_pipeInfoGen{0};  // bumped when a pipeline is destroyed: per-thread caches start over
+
+const PipeInfo* FindPipeInfo(VkPipeline p) {
+    thread_local std::unordered_map<VkPipeline, const PipeInfo*> cache;
+    thread_local uint32_t cacheGen = UINT32_MAX;
+    uint32_t gen = g_pipeInfoGen.load(std::memory_order_acquire);
+    if (gen != cacheGen) {
+        cache.clear();
+        cacheGen = gen;
+    }
+    auto c = cache.find(p);
+    if (c != cache.end()) return c->second;
+    const PipeInfo* info = nullptr;
+    {
+        std::shared_lock<std::shared_mutex> lk(g_pipeInfoLock);
+        auto it = g_pipeInfo.find(p);
+        if (it != g_pipeInfo.end()) info = it->second.get();
+    }
+    if (info) cache.emplace(p, info);  // (not cached while unknown: it may be registered a moment later)
+    return info;
+}
+
+// Guards g_setLayoutOf and g_setLayouts for the descriptor-set bind hook (written under g_t as well).
+std::shared_mutex g_descLock;
+
+struct HotState {
+    std::atomic<uint64_t> frame{0};            // g_frame
+    std::atomic<bool> drawLog{false};          // the draw log (Ctrl+Shift+L) covers this frame
+    std::atomic<bool> probe{false};            // ProbeFrame(g_frame): read the model matrices this frame
+    std::atomic<bool> objects{false};          // object motion on and some meshes known to move
+    std::atomic<bool> jitter{false};           // ViewportJitterOn()
+    std::atomic<bool> jitterScreen{false};     // jitter_screen_passes
+    std::atomic<bool> jitterOther{false};      // jitter_other_targets
+    std::atomic<uint32_t> inW{0}, inH{0};      // render size
+    std::atomic<uint64_t> jitterFrame{UINT64_MAX};  // the frame jitterXY belongs to
+    std::atomic<uint64_t> jitterXY{0};         // that frame's jitter, two floats
+} g_hot;
+// Meshes that moved recently (g_movingMeshes), rebuilt at present; a render pass takes a reference.
+std::shared_ptr<const std::unordered_set<uint64_t>> g_movingSnap;
 VkExtent2D g_swapExtent = {0, 0};
 uint32_t g_sceneRenderW = 0;  // width of the scene depth buffer = render width
 
@@ -958,6 +1034,7 @@ void LogViewFromMemory(const CmdState& cs) {  // caller holds g_t
 // framebuffer. (Other passes - shadow cascades, environment cubemaps - use their own cameras.)
 void CheckForView(CmdState& cs) {
     if (cs.hasView || cs.sets.empty() || !cs.fbIsScene) return;
+    cs.viewGen = cs.setsGen;  // BeforeDraw looks again only after another bind
     const BoundSet& bs = cs.sets[0];
     auto c = g_setContents.find(bs.set);
     if (c == g_setContents.end()) return;
@@ -990,8 +1067,20 @@ std::pair<int, int> FindSampled(const CmdState& cs, VkImage img) {
 // =============================================================================================
 // DLSS state
 // =============================================================================================
-enum class Backend { None, Dlss, Fsr };
-const char* BackendName(Backend b) { return b == Backend::Dlss ? "DLSS" : b == Backend::Fsr ? "FSR 3.1" : "none"; }
+enum class Backend { None, Dlss, Fsr, Test };
+const char* BackendName(Backend b) {
+    return b == Backend::Dlss ? "DLSS" : b == Backend::Fsr ? "FSR 3.1" : b == Backend::Test ? "test upscaler" : "none";
+}
+// TF3_DLSS_TEST_UPSCALER=1 (the test harness): a bilinear resize (test_upscale.comp) replaces DLSS and
+// FSR 3.1, so everything around the upscaler can be tested on any GPU. Not a cfg setting on purpose.
+bool TestUpscaler() {
+    static int on = -1;
+    if (on < 0) {
+        const char* e = std::getenv("TF3_DLSS_TEST_UPSCALER");
+        on = e && *e == '1' ? 1 : 0;
+    }
+    return on != 0;
+}
 
 // Shared upscaler state (the name is historical: it holds DLSS and everything common to both).
 struct Dlss {
@@ -1078,6 +1167,16 @@ struct Dlss {
     VkImage shpImage = VK_NULL_HANDLE;   // temporary result, copied back into outImage
     VkImageView shpView = VK_NULL_HANDLE;
     VkImageView shpBoundOut = VK_NULL_HANDLE;
+    // test upscaler (TestUpscaler)
+    bool tstFailed = false;
+    VkDescriptorSetLayout tstSetLayout = VK_NULL_HANDLE;
+    VkPipelineLayout tstPipeLayout = VK_NULL_HANDLE;
+    VkPipeline tstPipeline = VK_NULL_HANDLE;
+    VkDescriptorPool tstPool = VK_NULL_HANDLE;
+    VkSampler tstSampler = VK_NULL_HANDLE;
+    VkImageView tstBoundOut = VK_NULL_HANDLE;  // the output view the cached sets point at
+    std::vector<std::pair<VkImageView, VkDescriptorSet>> tstSets;  // one per input colour view
+    bool tstSetUsed = false;
     // on-screen info box (overlay.comp)
     bool ovFailed = false, ovSetUsed = false;
     VkDescriptorSetLayout ovSetLayout = VK_NULL_HANDLE;
@@ -1230,19 +1329,38 @@ struct Capture {
     std::vector<CaptureFrame> pending;  // filled at submit, written after the GPU finishes
 } g_cap;
 
+// TF3_DLSS_CAPTURE=90,190 (test harness): record two frames in a row after each of these frames,
+// as the Ctrl+Shift+T test does.
+bool CaptureRequestedAt(uint64_t frame) {
+    static std::vector<uint64_t> frames = [] {
+        std::vector<uint64_t> v;
+        const char* e = std::getenv("TF3_DLSS_CAPTURE");
+        for (const char* p = e; p && *p;) {
+            char* end = nullptr;
+            unsigned long long f = std::strtoull(p, &end, 10);
+            if (end == p) break;
+            v.push_back(f);
+            p = *end ? end + 1 : end;
+        }
+        return v;
+    }();
+    return std::find(frames.begin(), frames.end(), frame) != frames.end();
+}
+bool RecordingPossible() {
+    static const bool env = [] {
+        const char* e = std::getenv("TF3_DLSS_CAPTURE");
+        return e && *e;
+    }();
+    return env || g_cfg.debugKeys;
+}
+
 // Frame trace (Ctrl+Shift+T): one log line per frame for kTraceFrames frames.
 constexpr uint64_t kTraceFrames = 240;
 uint64_t g_traceUntil = 0;
 
 double NowMs() {
-#ifdef _WIN32
-    static LARGE_INTEGER freq = [] { LARGE_INTEGER f; QueryPerformanceFrequency(&f); return f; }();
-    LARGE_INTEGER t;
-    QueryPerformanceCounter(&t);
-    return 1000.0 * (double)t.QuadPart / (double)freq.QuadPart;
-#else
-    return 0.0;
-#endif
+    using namespace std::chrono;
+    return duration<double, std::milli>(steady_clock::now().time_since_epoch()).count();
 }
 
 // Frames per second for the info box: frames presented in the last half second or so.
@@ -1493,6 +1611,9 @@ void InvalidateViewCaches(DeviceData* d) {
     g_dlss.mvDepthView = g_dlss.objDepthView = VK_NULL_HANDLE;
     g_dlss.mvSetUsed = g_dlss.objSetUsed = g_dlss.dbgSetUsed = false;
     g_dlss.dbgBoundMv = VK_NULL_HANDLE;  // forces the debug view to rebuild its sets too
+    if (g_dlss.tstPool) d->ResetDescriptorPool(d->device, g_dlss.tstPool, 0);
+    g_dlss.tstSets.clear();
+    g_dlss.tstSetUsed = false;
 }
 
 // Pipeline objects (once) and the per-size buffer. Caller holds g_t.
@@ -1740,11 +1861,29 @@ void FrameJitter(float& jx, float& jy, uint32_t* idxOut = nullptr, uint32_t* pha
         g_dlss.frameJy = Halton(idx, 3) - 0.5f;
         g_dlss.frameJitterIdx = idx;
         g_dlss.frameJitterPhases = phases;
+        uint32_t bx, by;
+        std::memcpy(&bx, &g_dlss.frameJx, 4);
+        std::memcpy(&by, &g_dlss.frameJy, 4);
+        g_hot.jitterXY.store(bx | (uint64_t)by << 32, std::memory_order_relaxed);
+        g_hot.jitterFrame.store(g_frame, std::memory_order_release);
     }
     jx = g_dlss.frameJx;
     jy = g_dlss.frameJy;
     if (idxOut) *idxOut = g_dlss.frameJitterIdx;
     if (phasesOut) *phasesOut = g_dlss.frameJitterPhases;
+}
+
+// FrameJitter for the draw hooks: no lock once this frame's jitter has been worked out.
+void HotFrameJitter(float& jx, float& jy) {
+    if (g_hot.jitterFrame.load(std::memory_order_acquire) != g_hot.frame.load(std::memory_order_acquire)) {
+        TLock lk(g_t);
+        FrameJitter(jx, jy);
+        return;
+    }
+    uint64_t xy = g_hot.jitterXY.load(std::memory_order_relaxed);
+    uint32_t bx = (uint32_t)xy, by = (uint32_t)(xy >> 32);
+    std::memcpy(&jx, &bx, 4);
+    std::memcpy(&jy, &by, 4);
 }
 
 // Jitter is on while DLSS is running (it ran this frame or the previous one).
@@ -2078,7 +2217,7 @@ bool EnsureImages(DeviceData* d, uint32_t inW, uint32_t inH, uint32_t outW, uint
         if (g_dlss.mvImage) Log("[upscale] render size changed to %ux%u", inW, inH);
         if (!CreateOwnImage(d, inW, inH, VK_FORMAT_R16G16_SFLOAT,
                             VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-                                VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+                                VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,  // recordings
                             &g_dlss.mvImage, &g_dlss.mvView) ||
             !CreateOwnImage(d, inW, inH, VK_FORMAT_R32_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
                             &g_dlss.depth32Image, &g_dlss.depth32View)) {
@@ -2467,14 +2606,14 @@ bool ViewportJitterOn() { return JitterActive(); }
 // Which draws get the jitter. Only 3D geometry: full-screen passes (reflections, ambient occlusion,
 // bloom, ...) work per pixel on images that are already jittered, and shifting them as well made the
 // screen-space reflections flicker black on water. 3D draws are jittered in every render-size target,
-// so passes that the scene reads back (the water normals) line up with it. Caller holds g_t.
+// so passes that the scene reads back (the water normals) line up with it. No lock needed.
 bool JitterThisDraw(const CmdState& cs) {
-    if (!ViewportJitterOn()) return false;
-    auto ps = g_pipeState.find(cs.pipeline);
-    bool screenPass = ps != g_pipeState.end() && !ps->second.depthTest;
-    if (screenPass && !g_cfg.jitterScreenPasses) return false;
+    if (!g_hot.jitter.load(std::memory_order_relaxed)) return false;
+    bool screenPass = cs.pipe && cs.pipe->screenPass;
+    if (screenPass && !g_hot.jitterScreen.load(std::memory_order_relaxed)) return false;
     if (cs.fbIsScene) return true;
-    return g_cfg.jitterOtherTargets && !screenPass && g_dlss.inW && cs.fbW == g_dlss.inW && cs.fbH == g_dlss.inH;
+    uint32_t w = g_hot.inW.load(std::memory_order_relaxed), h = g_hot.inH.load(std::memory_order_relaxed);
+    return g_hot.jitterOther.load(std::memory_order_relaxed) && !screenPass && w && cs.fbW == w && cs.fbH == h;
 }
 // Solid geometry only: overlay lines/points drawn in 3D (guides, routes...) aren't objects.
 bool IsTriangles(VkPrimitiveTopology t) {
@@ -2482,21 +2621,25 @@ bool IsTriangles(VkPrimitiveTopology t) {
            t == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN;
 }
 
-// Record time, every scene draw: remember draws of meshes that have moved recently. Caller holds g_t.
-void ObjRecordDraw(CmdState& cs, bool indexed, uint32_t count, uint32_t instanceCount, uint32_t first,
-                   int32_t vertexOffset, uint32_t firstInstance) {
-    if (!g_cfg.objectMotion || !g_cfg.motionVectors || g_movingMeshes.empty()) return;
-    if (!cs.fbIsScene || !instanceCount) return;
-    auto pi = g_pipeVtx.find(cs.pipeline);
-    if (pi == g_pipeVtx.end()) return;
-    const PipeVtx& pv = pi->second;
+// Every scene draw, without a lock: the mesh if this draw is of a mesh that moved recently, else 0.
+uint64_t ObjCandidate(const CmdState& cs, bool indexed, uint32_t count, uint32_t instanceCount, uint32_t first,
+                      int32_t vertexOffset) {
+    if (!g_hot.objects.load(std::memory_order_relaxed) || !cs.fbIsScene || !instanceCount || !cs.moving ||
+        !cs.pipe || !cs.pipe->hasVtx)
+        return 0;
+    const PipeVtx& pv = cs.pipe->vtx;
     if (!pv.hasMdl || !pv.instanceRate || !IsTriangles(pv.topology) || pv.cols != 4 ||
         pv.fmt != VK_FORMAT_R32G32B32A32_SFLOAT || pv.mdlBinding >= 16 ||
         pv.posBinding >= 16 || !FormatComps(pv.posFormat) || pv.posInstanceRate)
-        return;
+        return 0;
     uint64_t mesh = MeshHash(cs, pv, indexed, count, first, vertexOffset);
-    auto mm = g_movingMeshes.find(mesh);
-    if (mm == g_movingMeshes.end() || mm->second + kObjMeshKeep < g_frame) return;
+    return cs.moving->count(mesh) ? mesh : 0;
+}
+
+// For a draw ObjCandidate picked: remember it for the object motion pass. Caller holds g_t.
+void ObjRecordDraw(CmdState& cs, uint64_t mesh, bool indexed, uint32_t count, uint32_t instanceCount,
+                   uint32_t first, int32_t vertexOffset, uint32_t firstInstance) {
+    const PipeVtx& pv = cs.pipe->vtx;
     if (g_objFrame.frame != g_frame) {
         g_objFrame = ObjFrame{};
         g_objFrame.frame = g_frame;
@@ -3354,6 +3497,109 @@ void RecordOverlay(DeviceData* d, VkCommandBuffer cb, Backend backend, const Cmd
 }
 
 // ---------------------------------------------------------------------------------------------
+// Test upscaler (TestUpscaler): bilinear resize of the input colour into outImage
+// ---------------------------------------------------------------------------------------------
+const uint32_t kTstSpirv[] = {
+#include "test_upscale.spv.inc"
+};
+constexpr uint32_t kTstSets = 8;
+
+bool EnsureTestUpscale(DeviceData* d) {
+    if (g_dlss.tstFailed) return false;
+    if (!g_dlss.tstPipeline) {
+        g_dlss.tstFailed = true;  // cleared on success
+        VkDescriptorSetLayoutBinding b[2] = {};
+        b[0] = {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+        b[1] = {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+        VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        li.bindingCount = 2;
+        li.pBindings = b;
+        if (d->CreateDescriptorSetLayout(d->device, &li, nullptr, &g_dlss.tstSetLayout) != VK_SUCCESS) return false;
+        VkPushConstantRange pr{VK_SHADER_STAGE_COMPUTE_BIT, 0, 8};
+        VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        pli.setLayoutCount = 1;
+        pli.pSetLayouts = &g_dlss.tstSetLayout;
+        pli.pushConstantRangeCount = 1;
+        pli.pPushConstantRanges = &pr;
+        if (d->CreatePipelineLayout(d->device, &pli, nullptr, &g_dlss.tstPipeLayout) != VK_SUCCESS) return false;
+        VkShaderModuleCreateInfo si{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        si.codeSize = sizeof kTstSpirv;
+        si.pCode = kTstSpirv;
+        VkShaderModule mod;
+        if (d->CreateShaderModule(d->device, &si, nullptr, &mod) != VK_SUCCESS) return false;
+        VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        ci.stage.module = mod;
+        ci.stage.pName = "main";
+        ci.layout = g_dlss.tstPipeLayout;
+        VkResult r = d->CreateComputePipelines(d->device, VK_NULL_HANDLE, 1, &ci, nullptr, &g_dlss.tstPipeline);
+        d->DestroyShaderModule(d->device, mod, nullptr);
+        if (r != VK_SUCCESS) return false;
+        VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kTstSets},
+                                        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, kTstSets}};
+        VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        pi.maxSets = kTstSets;
+        pi.poolSizeCount = 2;
+        pi.pPoolSizes = sizes;
+        if (d->CreateDescriptorPool(d->device, &pi, nullptr, &g_dlss.tstPool) != VK_SUCCESS) return false;
+        VkSamplerCreateInfo smp{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+        smp.magFilter = smp.minFilter = VK_FILTER_LINEAR;
+        smp.addressModeU = smp.addressModeV = smp.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        if (d->CreateSampler(d->device, &smp, nullptr, &g_dlss.tstSampler) != VK_SUCCESS) return false;
+        g_dlss.tstFailed = false;
+        Log("[test] test upscaler ready (TF3_DLSS_TEST_UPSCALER=1)");
+    }
+    if (g_dlss.tstBoundOut != g_dlss.outView) {  // output image recreated: the sets point at the old one
+        if (g_dlss.tstSetUsed) d->DeviceWaitIdle(d->device);
+        d->ResetDescriptorPool(d->device, g_dlss.tstPool, 0);
+        g_dlss.tstSets.clear();
+        g_dlss.tstSetUsed = false;
+        g_dlss.tstBoundOut = g_dlss.outView;
+    }
+    return true;
+}
+
+// Input colour in SHADER_READ_ONLY_OPTIMAL, outImage in GENERAL. Caller holds g_t.
+bool RecordTestUpscale(DeviceData* d, VkCommandBuffer cb, const CmdState& cs) {
+    if (!EnsureTestUpscale(d)) return false;
+    bool isNew = false;
+    VkDescriptorSet set = CachedSetRaw(d, g_dlss.tstSets, cs.colorView, g_dlss.tstPool, g_dlss.tstSetLayout,
+                                       g_dlss.tstSetUsed, isNew);
+    if (!set) return false;
+    if (isNew) {
+        VkDescriptorImageInfo src{g_dlss.tstSampler, cs.colorView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        VkDescriptorImageInfo dst{VK_NULL_HANDLE, g_dlss.outView, VK_IMAGE_LAYOUT_GENERAL};
+        VkWriteDescriptorSet w[2] = {};
+        w[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, set, 0, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                &src, nullptr, nullptr};
+        w[1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, set, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &dst,
+                nullptr, nullptr};
+        d->UpdateDescriptorSets(d->device, 2, w, 0, nullptr);
+    }
+    VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    b.image = g_dlss.outImage;
+    b.oldLayout = b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    b.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    b.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr,
+                          0, nullptr, 1, &b);
+    int32_t size[2] = {(int32_t)g_dlss.outW, (int32_t)g_dlss.outH};
+    d->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_dlss.tstPipeline);
+    d->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_dlss.tstPipeLayout, 0, 1, &set, 0, nullptr);
+    d->CmdPushConstants(cb, g_dlss.tstPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof size, size);
+    d->CmdDispatch(cb, (g_dlss.outW + 7) / 8, (g_dlss.outH + 7) / 8, 1);
+    b.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr,
+                          0, nullptr, 1, &b);
+    g_dlss.tstSetUsed = true;
+    return true;
+}
+
+// ---------------------------------------------------------------------------------------------
 // Which upscaler runs
 // ---------------------------------------------------------------------------------------------
 UpscalerPref ActivePref() {
@@ -3378,8 +3624,9 @@ Backend ChooseBackend() {
     bool dlssOk = g_dlss.ngxReady && !g_dlss.failed;
     auto fsrOk = [] { return !g_fsr.failed && FsrLoad(); };
     Backend b = Backend::None;
+    if (TestUpscaler()) p = p == UpscalerPref::Off ? p : UpscalerPref::Auto;
     switch (p) {
-        case UpscalerPref::Auto: b = dlssOk ? Backend::Dlss : fsrOk() ? Backend::Fsr : Backend::None; break;
+        case UpscalerPref::Auto: b = TestUpscaler() ? Backend::Test : dlssOk ? Backend::Dlss : fsrOk() ? Backend::Fsr : Backend::None; break;
         case UpscalerPref::Dlss: b = dlssOk ? Backend::Dlss : Backend::None; break;
         case UpscalerPref::Fsr: b = fsrOk() ? Backend::Fsr : Backend::None; break;
         case UpscalerPref::Off: break;
@@ -3502,6 +3749,10 @@ void RecordUpscale(DeviceData* d, VkCommandBuffer cb, CmdState& cs) {
         g_dlss.mvSetUsed = true;
         cs.mvSlot = slot;
         cs.mvPending = true;
+        if (g_cap.requested > 0 && !((ci.usage & di.usage) & VK_IMAGE_USAGE_TRANSFER_SRC_BIT)) {
+            Log("[record] the game's colour/depth images can't be copied (set debug_keys=1 and restart the game)");
+            g_cap.requested = 0;
+        }
         if (g_cap.requested > 0 && EnsureCaptureBuffers(d, ci.w, ci.h)) {
             RecordCaptureCopies(d, cb, cs, depthAspects);
             --g_cap.requested;
@@ -3555,8 +3806,10 @@ void RecordUpscale(DeviceData* d, VkCommandBuffer cb, CmdState& cs) {
         NVSDK_NGX_Result r = NGX_VULKAN_EVALUATE_DLSS_EXT(cb, g_dlss.handle, g_dlss.params, &ep);
         ok = NVSDK_NGX_SUCCEED(r);
         dlssResult = (unsigned)r;
-    } else {
+    } else if (backend == Backend::Fsr) {
         ok = RecordFsr(cb, cs, ci);
+    } else {
+        ok = RecordTestUpscale(d, cb, cs);
     }
     GpuMark(d, cb, kGmUpscaler);
 
@@ -3571,7 +3824,7 @@ void RecordUpscale(DeviceData* d, VkCommandBuffer cb, CmdState& cs) {
                 VK_IMAGE_LAYOUT_GENERAL);
     }
     g_cap.outPending = false;
-    if (ok && backend == Backend::Dlss) RecordSharpen(d, cb);  // FSR sharpens itself (RCAS)
+    if (ok && backend != Backend::Fsr) RecordSharpen(d, cb);  // FSR sharpens itself (RCAS)
     GpuMark(d, cb, kGmSharpen);
     if (g_cfg.debugView && ok && (g_cfg.debugView == 2 || cs.mvPending)) RecordDebugView(d, cb, cs);
     if (ok) RecordOverlay(d, cb, backend, cs, ci.w, ci.h);
@@ -4674,6 +4927,19 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_CreateGraphicsPipelines(VkDevice devic
             g_pipelineKind[pPipelines[i]] = it->second;
             Log("[pipeline] %s uses %s", H(pPipelines[i]).c_str(), KindName(it->second));
         }
+    std::unique_lock<std::shared_mutex> pl(g_pipeInfoLock);
+    for (uint32_t i = 0; i < count; ++i) {
+        if (!pPipelines[i]) continue;
+        auto info = std::make_unique<PipeInfo>();
+        auto k = g_pipelineKind.find(pPipelines[i]);
+        if (k != g_pipelineKind.end()) info->kind = k->second;
+        info->vp = pvp[i];
+        auto v = g_pipeVtx.find(pPipelines[i]);
+        if (v != g_pipeVtx.end()) info->hasVtx = true, info->vtx = v->second;
+        auto st = g_pipeState.find(pPipelines[i]);
+        info->screenPass = st != g_pipeState.end() && !st->second.depthTest;
+        g_pipeInfo[pPipelines[i]] = std::move(info);
+    }
     return r;
 }
 
@@ -4685,6 +4951,9 @@ static VKAPI_ATTR void VKAPI_CALL tf3_DestroyPipeline(VkDevice device, VkPipelin
         g_pipeVtx.erase(pipeline);
         g_pipeVp.erase(pipeline);
         g_pipeState.erase(pipeline);
+        std::unique_lock<std::shared_mutex> pl(g_pipeInfoLock);
+        g_pipeInfo.erase(pipeline);
+        g_pipeInfoGen.fetch_add(1, std::memory_order_release);
     }
     GetDevice(Key(device))->DestroyPipeline(device, pipeline, pAllocator);
 }
@@ -4740,6 +5009,12 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_CreateImage(VkDevice device, const VkI
         info.usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
         addedSampled = true;
     }
+    // Recordings (Ctrl+Shift+T, TF3_DLSS_CAPTURE) copy the depth and the upscaler's input colour out, which
+    // needs TRANSFER_SRC. Only added when recordings are possible: players' images stay as the game made them.
+    if (RecordingPossible() && info.imageType == VK_IMAGE_TYPE_2D && info.extent.width >= 1000 &&
+        (info.usage & (VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) &&
+        (info.usage & VK_IMAGE_USAGE_SAMPLED_BIT))
+        info.usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
     DeviceData* d = GetDevice(Key(device));
     VkResult r = d->CreateImage(device, &info, pAllocator, pImage);
     if (r != VK_SUCCESS && addedSampled) {
@@ -4938,6 +5213,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_CreateDescriptorSetLayout(VkDevice dev
                          pInfo->pBindings[i].descriptorCount});
         std::sort(b.begin(), b.end(), [](const LayoutBinding& x, const LayoutBinding& y) { return x.binding < y.binding; });
         TLock lk(g_t);
+        std::unique_lock<std::shared_mutex> dl(g_descLock);
         g_setLayouts[*pLayout] = std::move(b);
         if (pInfo->flags & VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT)
             g_updateAfterBindLayouts.insert(*pLayout);
@@ -4952,6 +5228,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_AllocateDescriptorSets(VkDevice device
     if (r == VK_SUCCESS) {
         PerfScope ps(kPerfDesc);
         TLock lk(g_t);
+        std::unique_lock<std::shared_mutex> dl(g_descLock);
         for (uint32_t i = 0; i < pInfo->descriptorSetCount; ++i) {
             g_setLayoutOf[pSets[i]] = pInfo->pSetLayouts[i];
             g_setContents.erase(pSets[i]);
@@ -5055,7 +5332,6 @@ static VKAPI_ATTR void VKAPI_CALL tf3_UpdateDescriptorSetWithTemplateKHR(VkDevic
 static VKAPI_ATTR VkResult VKAPI_CALL tf3_BeginCommandBuffer(VkCommandBuffer cb, const VkCommandBufferBeginInfo* pInfo) {
     {
         PerfScope ps(kPerfState);
-        TLock lk(g_t);
         CmdFor(cb) = CmdState{};
     }
     return GetDevice(Key(cb))->BeginCommandBuffer(cb, pInfo);
@@ -5064,13 +5340,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_BeginCommandBuffer(VkCommandBuffer cb,
 static VKAPI_ATTR void VKAPI_CALL tf3_CmdBindPipeline(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipeline pipeline) {
     if (bp == VK_PIPELINE_BIND_POINT_GRAPHICS) {
         PerfScope ps(kPerfState);
-        TLock lk(g_t);
         auto& cs = CmdFor(cb);
-        auto it = g_pipelineKind.find(pipeline);
-        cs.kind = it == g_pipelineKind.end() ? Kind::Other : it->second;
+        cs.pipe = FindPipeInfo(pipeline);
+        cs.kind = cs.pipe ? cs.pipe->kind : Kind::Other;
         cs.pipeline = pipeline;
-        auto pv = g_pipeVp.find(pipeline);
-        if (pv == g_pipeVp.end() || !pv->second.dynamic) cs.hasCurVp = false;  // static viewport replaces ours
+        if (!cs.pipe || !cs.pipe->vp.dynamic) cs.hasCurVp = false;  // static viewport replaces ours
     }
     GetDevice(Key(cb))->CmdBindPipeline(cb, bp, pipeline);
 }
@@ -5081,7 +5355,6 @@ static VKAPI_ATTR void VKAPI_CALL tf3_CmdBindDescriptorSets(VkCommandBuffer cb, 
                                                             const uint32_t* dynOffsets) {
     if (bp == VK_PIPELINE_BIND_POINT_GRAPHICS) {
         PerfScope ps(kPerfBind);
-        TLock lk(g_t);
         auto& cs = CmdFor(cb);
         if (cs.sets.size() < firstSet + count) cs.sets.resize(firstSet + count);
         ++cs.setsGen;
@@ -5093,6 +5366,7 @@ static VKAPI_ATTR void VKAPI_CALL tf3_CmdBindDescriptorSets(VkCommandBuffer cb, 
             bs.dyn.clear();
             bs.dynOffsets.clear();
             if (di >= dynCount) continue;  // no dynamic offsets left (most binds have none)
+            std::shared_lock<std::shared_mutex> dl(g_descLock);
             auto lo = g_setLayoutOf.find(sets[i]);
             if (lo != g_setLayoutOf.end()) {
                 auto lb = g_setLayouts.find(lo->second);
@@ -5133,6 +5407,8 @@ static void BeginRp(VkCommandBuffer cb, const VkRenderPassBeginInfo* p) {
     cs.rcasInThisPass = false;
     cs.fbIsScene = false;
     cs.fbW = cs.fbH = 0;
+    cs.viewGen = UINT32_MAX;
+    cs.moving = g_movingSnap;
     for (VkImage img : FbImages(p->framebuffer)) {
         auto it = g_images.find(img);
         if (it != g_images.end() && !cs.fbW) {
@@ -5166,6 +5442,15 @@ static void AfterEndRp(DeviceData* d, VkCommandBuffer cb) {
     auto& cs = CmdFor(cb);
     {
         PerfScope ps(kPerfPass);
+        if (cs.hasSceneVp) {  // seen by ApplyViewport in this pass
+            const VkViewport& v = cs.sceneVp;
+            if (!g_dlss.sceneVpValid)
+                Log("[obj] scene viewport: x=%g y=%g w=%g h=%g depth %g..%g", v.x, v.y, v.width, v.height,
+                    v.minDepth, v.maxDepth);
+            g_dlss.sceneVp = v;
+            g_dlss.sceneVpValid = true;
+            cs.hasSceneVp = false;
+        }
         auto rp = g_renderPasses.find(cs.rp);
         if (rp != g_renderPasses.end()) {
             auto imgs = FbImages(cs.fb);
@@ -5215,29 +5500,25 @@ static void SwapRestore(DeviceData* d, VkCommandBuffer cb, const SwapPlan& plan)
 // Jitter by shifting the viewport of draws into the scene framebuffer by the sub-pixel offset.
 // Only what DLSS upscales is jittered; the camera data stays untouched, so passes that aren't
 // upscaled (the selection mask behind the hover outline, terrain tile caches, ...) are unaffected.
-// Caller holds g_t.
+// No lock needed (the scene viewport goes to g_dlss when the render pass ends).
 void ApplyViewport(DeviceData* d, VkCommandBuffer cb, CmdState& cs) {
-    auto pi = g_pipeVp.find(cs.pipeline);
-    if (pi == g_pipeVp.end() || !pi->second.dynamic) return;
+    if (!cs.pipe || !cs.pipe->vp.dynamic) return;
     VkViewport want;
-    if (pi->second.patched) want = pi->second.staticVp;
+    if (cs.pipe->vp.patched) want = cs.pipe->vp.staticVp;
     else if (cs.hasGameVp) want = cs.gameVp;
     else return;
     if (cs.fbIsScene) {
-        if (!g_dlss.sceneVpValid)
-            Log("[obj] scene viewport: x=%g y=%g w=%g h=%g depth %g..%g (pipeline viewport %s)", want.x, want.y,
-                want.width, want.height, want.minDepth, want.maxDepth, pi->second.patched ? "baked in" : "dynamic");
-        g_dlss.sceneVp = want;
-        g_dlss.sceneVpValid = true;
+        cs.sceneVp = want;
+        cs.hasSceneVp = true;
     }
     if (JitterThisDraw(cs)) {
         float jx, jy;
-        FrameJitter(jx, jy);
+        HotFrameJitter(jx, jy);
         want.x += jx;  // jitter is in top-down pixels, like framebuffer coordinates
         want.y += jy;
-        static bool logged = false;
-        if (!logged) Log("[jitter] viewport jitter active (frame %llu)", (unsigned long long)g_frame);
-        logged = true;
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true))
+            Log("[jitter] viewport jitter active (frame %llu)", (unsigned long long)g_hot.frame.load());
     }
     if (cs.hasCurVp && std::memcmp(&want, &cs.curVp, sizeof want) == 0) return;
     d->CmdSetViewport(cb, 0, 1, &want);
@@ -5249,7 +5530,6 @@ static VKAPI_ATTR void VKAPI_CALL tf3_CmdSetViewport(VkCommandBuffer cb, uint32_
                                                      const VkViewport* pViewports) {
     {
         PerfScope ps(kPerfState);
-        TLock lk(g_t);
         CmdState& cs = CmdFor(cb);
         if (first == 0 && count >= 1) {
             cs.gameVp = cs.curVp = pViewports[0];
@@ -5263,7 +5543,6 @@ static VKAPI_ATTR void VKAPI_CALL tf3_CmdSetScissor(VkCommandBuffer cb, uint32_t
                                                     const VkRect2D* pScissors) {
     {
         PerfScope ps(kPerfState);
-        TLock lk(g_t);
         CmdState& cs = CmdFor(cb);
         if (first == 0 && count >= 1) {
             cs.scissor = pScissors[0];
@@ -5333,14 +5612,12 @@ struct ProbeFrameData {
 };
 ProbeFrameData g_probeCur, g_probePrev;
 
-// Caller holds g_t.
+// No lock needed: fills this command buffer's list, read at submit.
 void ProbeDraw(CmdState& cs, bool indexed, uint32_t count, uint32_t instanceCount, uint32_t first,
                int32_t vertexOffset, uint32_t firstInstance) {
-    if (!ProbeFrame(g_frame)) return;
-    if (!cs.fbIsScene) return;
-    auto pi = g_pipeVtx.find(cs.pipeline);
-    if (pi == g_pipeVtx.end()) return;
-    const PipeVtx& pv = pi->second;
+    if (!g_hot.probe.load(std::memory_order_relaxed)) return;
+    if (!cs.fbIsScene || !cs.pipe || !cs.pipe->hasVtx) return;
+    const PipeVtx& pv = cs.pipe->vtx;
     if (!pv.hasMdl || !pv.instanceRate || !IsTriangles(pv.topology) || pv.mdlBinding >= 16 || pv.cols < 4 ||
         pv.comps < 3)
         return;
@@ -5432,12 +5709,28 @@ void ProbeReport() {
     g_probeCur = ProbeFrameData{};
 }
 
+// The per-frame values the draw hooks read without g_t. Caller holds g_t; at present, for the next frame.
+void UpdateHot() {
+    g_hot.frame.store(g_frame, std::memory_order_release);
+    g_hot.drawLog.store(g_drawLog.frame == g_frame, std::memory_order_relaxed);
+    g_hot.probe.store(ProbeFrame(g_frame), std::memory_order_relaxed);
+    auto snap = std::make_shared<std::unordered_set<uint64_t>>();
+    for (const auto& [mesh, last] : g_movingMeshes)
+        if (last + kObjMeshKeep >= g_frame) snap->insert(mesh);
+    if (!g_movingSnap || *g_movingSnap != *snap) g_movingSnap = std::move(snap);
+    g_hot.objects.store(g_cfg.objectMotion && g_cfg.motionVectors && !g_movingSnap->empty(), std::memory_order_relaxed);
+    g_hot.jitter.store(ViewportJitterOn(), std::memory_order_relaxed);
+    g_hot.jitterScreen.store(g_cfg.jitterScreenPasses != 0, std::memory_order_relaxed);
+    g_hot.jitterOther.store(g_cfg.jitterOtherTargets != 0, std::memory_order_relaxed);
+    g_hot.inW.store(g_dlss.inW, std::memory_order_relaxed);
+    g_hot.inH.store(g_dlss.inH, std::memory_order_relaxed);
+}
+
 static VKAPI_ATTR void VKAPI_CALL tf3_CmdBindVertexBuffers(VkCommandBuffer cb, uint32_t firstBinding,
                                                            uint32_t bindingCount, const VkBuffer* pBuffers,
                                                            const VkDeviceSize* pOffsets) {
     {
         PerfScope ps(kPerfState);
-        TLock lk(g_t);
         CmdState& cs = CmdFor(cb);
         for (uint32_t i = 0; i < bindingCount; ++i)
             if (firstBinding + i < 16) cs.vb[firstBinding + i] = {pBuffers[i], pOffsets[i]};
@@ -5449,7 +5742,6 @@ static VKAPI_ATTR void VKAPI_CALL tf3_CmdBindIndexBuffer(VkCommandBuffer cb, VkB
                                                          VkIndexType type) {
     {
         PerfScope ps(kPerfState);
-        TLock lk(g_t);
         CmdState& cs = CmdFor(cb);
         cs.ib = buffer;
         cs.ibOff = offset;
@@ -5466,17 +5758,25 @@ bool SkipGameFsrDraw(const CmdState& cs) {
            g_lastDlssFrame != UINT64_MAX && g_lastDlssFrame + 1 >= g_frame;
 }
 
-// Everything the layer does before a game draw, under one lock. Fills `plan` with the descriptor set
-// to swap in for this draw (the blit), and returns false if the draw is to be left out.
+// Everything the layer does before a game draw. Fills `plan` with the descriptor set to swap in for this
+// draw (the blit), and returns false if the draw is to be left out. Most draws need no lock; g_t only
+// for the draws OnDraw has work for, moving objects and the draw log.
 bool BeforeDraw(DeviceData* d, VkCommandBuffer cb, bool indexed, uint32_t count, uint32_t instances, uint32_t first,
                 int32_t vertexOffset, uint32_t firstInstance, SwapPlan& plan) {
     PerfScope ps(kPerfDraw);
-    TLock lk(g_t);
     CmdState& cs = CmdFor(cb);
-    LogSceneDraw(cb, cs, indexed, count, instances, firstInstance);
     ProbeDraw(cs, indexed, count, instances, first, vertexOffset, firstInstance);
-    ObjRecordDraw(cs, indexed, count, instances, first, vertexOffset, firstInstance);
+    uint64_t mesh = ObjCandidate(cs, indexed, count, instances, first, vertexOffset);
     ApplyViewport(d, cb, cs);
+    bool slow = mesh || cs.kind != Kind::Other || g_hot.drawLog.load(std::memory_order_relaxed) ||
+                // OnDraw: still looking for the camera buffer, and a set was bound since the last look
+                (cs.fbIsScene && !cs.hasView && !cs.sets.empty() && cs.viewGen != cs.setsGen) ||
+                // OnDraw: after RCAS, the blit search or the swap itself
+                (cs.rcasOut && (cs.blitGen != cs.setsGen || cs.blitHit.first >= 0));
+    if (!slow) return true;
+    TLock lk(g_t);
+    LogSceneDraw(cb, cs, indexed, count, instances, firstInstance);
+    if (mesh) ObjRecordDraw(cs, mesh, indexed, count, instances, first, vertexOffset, firstInstance);
     plan = OnDraw(d, cs);
     if (cs.kind == Kind::FsrEasu) GpuMark(d, cb, kGmGameFsr);
     return !SkipGameFsrDraw(cs);
@@ -5666,6 +5966,10 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_QueuePresentKHR(VkQueue queue, const V
                 (unsigned long long)g_frame);
         }
 #endif
+        if (CaptureRequestedAt(g_frame)) {
+            g_cap.requested = 2;
+            g_cap.phase = "frame " + std::to_string(g_frame);
+        }
         if (g_cfg.cfgLive && g_frame % 60 == 0 && ConfigChanged()) {
             int wasEnabled = g_cfg.enabled;
             UpscalerPref wasPref = g_cfg.upscaler;
@@ -5705,6 +6009,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_QueuePresentKHR(VkQueue queue, const V
                 g_lastDlssFrame == g_frame ? "ran" : "did not run", g_lastSwapFrame == g_frame ? "yes" : "no");
         }
         ++g_frame;
+        UpdateHot();
     }
     {
         TLock lk(g_t);

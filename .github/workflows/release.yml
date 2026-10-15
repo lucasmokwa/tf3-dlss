@@ -16,6 +16,7 @@ on:
 
 permissions:
   contents: write
+  actions: read  # the harness job reads the latest main build's results
 
 concurrency:
   group: release-${{ github.ref }}
@@ -57,8 +58,73 @@ jobs:
           echo "publish=$publish" >> "$GITHUB_OUTPUT"
           echo "layer.cpp $src, latest release ${latest:-none} -> version $ver, publish=$publish"
 
+  # Runs the layer in harness/fake_tf3 on Mesa's CPU Vulkan driver (lavapipe), with a test upscaler in
+  # place of DLSS / FSR and the Khronos validation layer: motion vectors, the blit swap, validation.
+  # A failure stops the build, so nothing is released.
+  harness:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Get the NVIDIA DLSS SDK headers
+        uses: actions/checkout@v4
+        with:
+          repository: NVIDIA/DLSS
+          ref: ${{ env.DLSS_SDK_REF }}
+          path: _sdk/DLSS
+          sparse-checkout: include
+          sparse-checkout-cone-mode: true
+      - name: Install Vulkan (lavapipe, validation layer, glslang)
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends cmake ninja-build g++ libvulkan-dev \
+            mesa-vulkan-drivers vulkan-validationlayers vulkan-tools glslang-tools
+      - name: Build
+        run: |
+          cmake -S harness -B build/harness -G Ninja -DCMAKE_BUILD_TYPE=Release -DDLSS_SDK="$PWD/_sdk/DLSS"
+          cmake --build build/harness
+      - name: Run
+        run: harness/run.sh build/harness logs/harness
+      # The latest successful build of main, for its metrics.json: the cost tables show the change.
+      - name: Find the latest main build
+        id: main
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          id=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/release.yml/runs?branch=main&event=push&status=success&per_page=1" \
+               --jq '.workflow_runs[0].id // empty' || true)
+          # builds of main from before the harness have no results: nothing to compare with
+          if [ -n "$id" ] && [ "$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$id/artifacts?name=harness-results" \
+               --jq '.total_count' || echo 0)" = 0 ]; then id=""; fi
+          echo "run_id=$id" >> "$GITHUB_OUTPUT"
+          echo "latest main build: ${id:-none}"
+      - name: Get its harness results
+        if: always() && steps.main.outputs.run_id != ''
+        continue-on-error: true  # expired results: the summary then has nothing to compare with
+        uses: actions/download-artifact@v4
+        with:
+          name: harness-results
+          path: _main
+          run-id: ${{ steps.main.outputs.run_id }}
+          github-token: ${{ github.token }}
+      - name: Summary (checks and the layer's cost against main, on the run's page)
+        if: always()
+        run: |
+          python3 harness/summary.py logs/harness _main/metrics.json > logs/harness/summary.md || exit 0
+          cat logs/harness/summary.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: harness-results
+          path: |
+            logs/harness/**/fake_tf3.txt
+            logs/harness/**/result.json
+            logs/harness/**/tf3_dlss.log
+            logs/harness/summary.md
+            logs/harness/metrics.json
+
   build:
-    needs: version
+    needs: [version, harness]
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
