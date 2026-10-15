@@ -128,6 +128,12 @@ The CI build fetches the DLSS SDK from [NVIDIA/DLSS](https://github.com/NVIDIA/D
 `DLSS_SDK_REF`, the Vulkan SDK from LunarG and the FSR runtime with `get_fsr.ps1`. Pull requests get the
 same build, with the zip under the run's artifacts instead of a release.
 
+After the release, the `nexus` job uploads the same zip to the
+[Nexus Mods page](https://www.nexusmods.com/transportfever3/mods/17) as a new version of the main file
+(`NEXUS_FILE_ID`), archives the previous version, sets the page's version and adds the release's PR
+titles as the changelog. It needs a Nexus API key in the `NEXUSMODS_API_KEY` repository secret and is
+skipped without one. If Nexus fails, re-run just that job; the GitHub release is already out.
+
 ## Hotkeys
 
 All hotkeys need `debug_keys=1` in the cfg (off by default, so no key press changes the upscaler
