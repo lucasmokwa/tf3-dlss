@@ -32,13 +32,6 @@ layout(location = 0) out vec4 prevClip;
 void main() {
     mat4 cur = mat4(mdl0, mdl1, mdl2, mdl3);
     mat4 prev = mat4(prv0, prv1, prv2, prv3);
-    if (cur == prev) {
-        // Didn't move (or wasn't matched): the camera pass already has its motion. Outside the clip
-        // volume, so the instance's triangles are dropped before any pixel work.
-        gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
-        prevClip = vec4(0.0);
-        return;
-    }
     vec4 world = cur * inPos;
     vec4 worldPrev = prev * inPos;
     gl_Position = u.curViewProj * vec4(world.xyz, 1.0);
