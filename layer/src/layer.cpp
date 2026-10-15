@@ -293,7 +293,7 @@ struct Config {
     int perf = 0;               // 1 = measure what the layer costs (CPU and GPU), in the log and the info box
     float perfSeconds = 5.f;    // perf=1: averaging window, seconds
     int skipGameFsr = 0;        // don't draw the game's FSR 1 passes while DLSS/FSR 3.1 replaces their result
-    int gpuCrashInfo = 1;       // GPU checkpoints + fault report in the log if the GPU crashes (needs a restart)
+    int gpuCrashInfo = 0;       // GPU checkpoints + fault report in the log if the GPU crashes (off by default; needs a restart)
 } g_cfg;
 
 std::filesystem::path g_cfgPath;
@@ -3293,7 +3293,7 @@ void ReportDeviceLost(DeviceData* d, const char* where) {
         Log("[gpu-crash] (if a queue's top and bottom of pipe name two different TF3-DLSS steps, the GPU stopped "
             "in the mod's work between them; if both say the game's, it stopped in the game's work)");
     } else
-        Log("[gpu-crash] no checkpoints (gpu_crash_info=0, or the driver doesn't offer them)");
+        Log("[gpu-crash] no checkpoints (turn them on with gpu_crash_info=1 and restart)");
     if (d->deviceFault) {
         VkDeviceFaultCountsEXT counts{VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT};
         if (d->GetDeviceFaultInfoEXT(d->device, &counts, nullptr) != VK_SUCCESS && counts.addressInfoCount == 0 &&
@@ -4524,7 +4524,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_CreateDevice(VkPhysicalDevice physical
     };
     bool addCheckpoints = false, addFault = false;
     VkPhysicalDeviceFaultFeaturesEXT faultFeat{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
-    if (g_cfg.gpuCrashInfo) {
+    bool crashInfo = g_cfg.gpuCrashInfo != 0;
+    if (crashInfo) {
         addCheckpoints = supported.count(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME) &&
                          !hasExt(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
         if (addCheckpoints) exts.push_back(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
@@ -4579,7 +4580,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_CreateDevice(VkPhysicalDevice physical
 #undef X
     d->checkpoints = extrasOk && addCheckpoints && d->CmdSetCheckpointNV && d->GetQueueCheckpointDataNV;
     d->deviceFault = extrasOk && addFault && d->GetDeviceFaultInfoEXT;
-    if (g_cfg.gpuCrashInfo)
+    if (crashInfo)
         Log("[device] GPU crash info: checkpoints %s, fault report %s", d->checkpoints ? "on" : "not offered",
             d->deviceFault ? "on" : "not offered");
     {
