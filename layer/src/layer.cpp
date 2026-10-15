@@ -293,6 +293,7 @@ struct Config {
     int perf = 0;               // 1 = measure what the layer costs (CPU and GPU), in the log and the info box
     float perfSeconds = 5.f;    // perf=1: averaging window, seconds
     int skipGameFsr = 0;        // don't draw the game's FSR 1 passes while DLSS/FSR 3.1 replaces their result
+    int gpuCrashInfo = 0;       // GPU checkpoints + fault report in the log if the GPU crashes (off by default; needs a restart)
 } g_cfg;
 
 std::filesystem::path g_cfgPath;
@@ -381,18 +382,19 @@ bool LoadConfig() {
         else if (k == "perf") c.perf = iv;
         else if (k == "perf_seconds") c.perfSeconds = std::min(std::max(fv, 1.f), 60.f);
         else if (k == "skip_game_fsr") c.skipGameFsr = iv;
+        else if (k == "gpu_crash_info") c.gpuCrashInfo = iv;
         else Log("[cfg] unknown setting '%s' ignored", k.c_str());
     }
     g_cfg = c;
     Log("[cfg] loaded %s: enabled=%d upscaler=%s preset=%d motion_vectors=%d object_motion=%d jitter=%d (phases %d, "
         "sign %g,%g, fsr sign %g,%g) sharpness=%g fsr_sharpness=%g mip_bias=%s%g fsr_color=%s fsr_debug=%d overlay=%d debug_keys=%d "
         "dlss_dev=%d mv_scale=(%g,%g) reset_distance=%g mv_double=%d debug_view=%d cfg_live=%d log_every=%d perf=%d "
-        "perf_seconds=%g skip_game_fsr=%d",
+        "perf_seconds=%g skip_game_fsr=%d gpu_crash_info=%d",
         g_cfgPath.string().c_str(), c.enabled, PrefName(c.upscaler), c.preset, c.motionVectors, c.objectMotion,
         c.jitter, c.jitterPhases, c.jitterSignX, c.jitterSignY, c.fsrJitterSignX, c.fsrJitterSignY, c.sharpness, c.fsrSharpness,
         c.mipBiasAuto ? "auto " : "", c.mipBias, c.fsrColorSrgb ? "srgb" : "linear", c.fsrDebug, c.overlay,
         c.debugKeys, c.dlssDev, c.mvScaleX, c.mvScaleY, c.resetDistance, c.mvDouble, c.debugView, c.cfgLive, c.logEvery,
-        c.perf, c.perfSeconds, c.skipGameFsr);
+        c.perf, c.perfSeconds, c.skipGameFsr, c.gpuCrashInfo);
     return true;
 }
 
@@ -466,7 +468,9 @@ struct InstanceData {
     X(CmdSetScissor)                          \
     X(CreateSampler)                          \
     X(QueueSubmit)                            \
-    X(QueuePresentKHR)
+    X(QueuePresentKHR)                        \
+    X(WaitForFences)                          \
+    X(GetFenceStatus)
 
 // ... and functions we only call ourselves.
 #define DEVICE_CALLS(X)            \
@@ -496,13 +500,18 @@ struct InstanceData {
     X(CmdWriteTimestamp)           \
     X(GetQueryPoolResults)         \
     X(CmdDrawIndirect)             \
-    X(CmdDrawIndexedIndirect)
+    X(CmdDrawIndexedIndirect)      \
+    X(CmdSetCheckpointNV)          \
+    X(GetQueueCheckpointDataNV)    \
+    X(GetDeviceFaultInfoEXT)
 
 struct DeviceData {
     VkDevice device = VK_NULL_HANDLE;
     VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
     InstanceData* instance = nullptr;
     PFN_vkGetDeviceProcAddr GetDeviceProcAddr = nullptr;
+    bool checkpoints = false;  // VK_NV_device_diagnostic_checkpoints enabled (gpu_crash_info)
+    bool deviceFault = false;  // VK_EXT_device_fault enabled (gpu_crash_info)
 #define X(name) PFN_vk##name name = nullptr;
     DEVICE_HOOKS(X)
     DEVICE_CALLS(X)
@@ -3146,7 +3155,9 @@ bool GpuPerfEnsure(DeviceData* d, VkCommandBuffer cb) {
 }
 
 // A timestamp into the current slot, once per slot. Caller holds g_t.
+void Checkpoint(DeviceData* d, VkCommandBuffer cb, uint32_t id);
 void GpuMark(DeviceData* d, VkCommandBuffer cb, GpuMarkId m) {
+    Checkpoint(d, cb, m);  // gpu_crash_info=1, whether or not perf=1
     if (!g_cfg.perf || !g_gpu.pool) return;
     uint32_t bit = 1u << m;
     if (g_gpu.written[g_gpu.slot] & bit) return;  // a query is written once between resets
@@ -3191,6 +3202,125 @@ void GpuFrameEnd(DeviceData* d, VkCommandBuffer cb) {
 void DestroyGpuPerf(DeviceData* d) {
     if (g_gpu.pool) d->DestroyQueryPool(d->device, g_gpu.pool, nullptr);
     g_gpu = GpuPerf{};
+}
+
+// ---------------------------------------------------------------------------------------------
+// GPU crash info (gpu_crash_info=1). A GPU crash ("device lost") gives the game nothing but an error
+// code, and its crash dump only shows the CPU side. So checkpoints go into the command stream: one at
+// the start of every game command buffer and one between each of the layer's passes (the same points
+// as the perf timings). After a crash the driver says which checkpoint each queue last reached at the
+// top and at the bottom of its pipeline, which tells whether the GPU stopped in one of our passes or in
+// the game's work. VK_EXT_device_fault adds the driver's own description and the faulting address.
+// ---------------------------------------------------------------------------------------------
+enum CheckpointId { kCpGameCb = kGmCount, kCpCount };
+const char* const kCheckpointNames[kCpCount] = {
+    "game: its FSR 1 pass",
+    "TF3-DLSS: start; camera motion vectors next",
+    "TF3-DLSS: camera motion done; object (vehicle) motion next",
+    "TF3-DLSS: motion vectors done; upscaler (DLSS / FSR) next",
+    "TF3-DLSS: upscaler done; sharpening next",
+    "TF3-DLSS: sharpening done; info box / debug view next",
+    "TF3-DLSS: done; the game's commands follow",
+    "game: start of a command buffer",
+};
+static_assert(kGmEnd + 1 == kCpGameCb, "a name per GpuMarkId, then the extra checkpoints");
+
+void Checkpoint(DeviceData* d, VkCommandBuffer cb, uint32_t id) {
+    if (d->checkpoints) d->CmdSetCheckpointNV(cb, kCheckpointNames[id]);
+}
+
+const char* CheckpointName(const void* marker) {
+    for (const char* n : kCheckpointNames)
+        if (marker == n) return n;
+    return "(not one of ours)";
+}
+
+std::mutex g_queueLock;
+std::vector<VkQueue> g_queues;  // every queue the game submitted to, for the checkpoint report
+std::atomic<bool> g_deviceLostReported{false};
+
+void NoteQueue(VkQueue q) {
+    thread_local VkQueue last = VK_NULL_HANDLE;
+    if (q == last) return;
+    last = q;
+    std::lock_guard<std::mutex> lk(g_queueLock);
+    if (std::find(g_queues.begin(), g_queues.end(), q) == g_queues.end()) g_queues.push_back(q);
+}
+
+const char* StageName(VkPipelineStageFlagBits s) {
+    switch (s) {
+        case VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT: return "top of pipe (started)";
+        case VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT: return "bottom of pipe (finished)";
+        default: return "other stage";
+    }
+}
+
+const char* FaultAddressType(VkDeviceFaultAddressTypeEXT t) {
+    switch (t) {
+        case VK_DEVICE_FAULT_ADDRESS_TYPE_NONE_EXT: return "none";
+        case VK_DEVICE_FAULT_ADDRESS_TYPE_READ_INVALID_EXT: return "read of an invalid address";
+        case VK_DEVICE_FAULT_ADDRESS_TYPE_WRITE_INVALID_EXT: return "write to an invalid address";
+        case VK_DEVICE_FAULT_ADDRESS_TYPE_EXECUTE_INVALID_EXT: return "execute at an invalid address";
+        case VK_DEVICE_FAULT_ADDRESS_TYPE_INSTRUCTION_POINTER_UNKNOWN_EXT: return "instruction pointer (unknown)";
+        case VK_DEVICE_FAULT_ADDRESS_TYPE_INSTRUCTION_POINTER_INVALID_EXT: return "instruction pointer (invalid)";
+        case VK_DEVICE_FAULT_ADDRESS_TYPE_INSTRUCTION_POINTER_FAULT_EXT: return "instruction pointer (fault)";
+        default: return "?";
+    }
+}
+
+// Once, the first time any call returns VK_ERROR_DEVICE_LOST. Doesn't take g_t: another thread may
+// hold it while waiting on the dead GPU.
+void ReportDeviceLost(DeviceData* d, const char* where) {
+    if (!d || g_deviceLostReported.exchange(true)) return;
+    Log("[gpu-crash] the GPU stopped (VK_ERROR_DEVICE_LOST, first seen by %s) around frame %llu", where,
+        (unsigned long long)g_hot.frame.load());
+    if (d->checkpoints) {
+        std::vector<VkQueue> queues;
+        {
+            std::lock_guard<std::mutex> lk(g_queueLock);
+            queues = g_queues;
+        }
+        for (VkQueue q : queues) {
+            uint32_t n = 0;
+            d->GetQueueCheckpointDataNV(q, &n, nullptr);
+            std::vector<VkCheckpointDataNV> cps(n, VkCheckpointDataNV{VK_STRUCTURE_TYPE_CHECKPOINT_DATA_NV});
+            if (n) d->GetQueueCheckpointDataNV(q, &n, cps.data());
+            if (!n) Log("[gpu-crash] queue %s: no checkpoints reached", H(q).c_str());
+            for (uint32_t i = 0; i < n; ++i)
+                Log("[gpu-crash] queue %s: last checkpoint at %s: %s", H(q).c_str(), StageName(cps[i].stage),
+                    CheckpointName(cps[i].pCheckpointMarker));
+        }
+        Log("[gpu-crash] (if a queue's top and bottom of pipe name two different TF3-DLSS steps, the GPU stopped "
+            "in the mod's work between them; if both say the game's, it stopped in the game's work)");
+    } else
+        Log("[gpu-crash] no checkpoints (turn them on with gpu_crash_info=1 and restart)");
+    if (d->deviceFault) {
+        VkDeviceFaultCountsEXT counts{VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT};
+        if (d->GetDeviceFaultInfoEXT(d->device, &counts, nullptr) != VK_SUCCESS && counts.addressInfoCount == 0 &&
+            counts.vendorInfoCount == 0) {
+            Log("[gpu-crash] the driver has no fault details");
+            return;
+        }
+        std::vector<VkDeviceFaultAddressInfoEXT> addrs(counts.addressInfoCount);
+        std::vector<VkDeviceFaultVendorInfoEXT> vendor(counts.vendorInfoCount);
+        VkDeviceFaultInfoEXT info{VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT};
+        info.pAddressInfos = addrs.empty() ? nullptr : addrs.data();
+        info.pVendorInfos = vendor.empty() ? nullptr : vendor.data();
+        counts.vendorBinarySize = 0;  // not the binary dump
+        VkResult r = d->GetDeviceFaultInfoEXT(d->device, &counts, &info);
+        Log("[gpu-crash] driver's fault report (%d): %s", (int)r, info.description);
+        for (uint32_t i = 0; i < counts.addressInfoCount && i < addrs.size(); ++i)
+            Log("[gpu-crash]   %s at 0x%llx (within 0x%llx)", FaultAddressType(addrs[i].addressType),
+                (unsigned long long)addrs[i].reportedAddress, (unsigned long long)addrs[i].addressPrecision);
+        for (uint32_t i = 0; i < counts.vendorInfoCount && i < vendor.size(); ++i)
+            Log("[gpu-crash]   %s (code 0x%llx, data 0x%llx)", vendor[i].description,
+                (unsigned long long)vendor[i].vendorFaultCode, (unsigned long long)vendor[i].vendorFaultData);
+    }
+}
+
+VkResult CheckLost(DeviceData* d, VkResult r, const char* where) {
+    if (r == VK_ERROR_DEVICE_LOST) ReportDeviceLost(d, where);
+    return r;
 }
 
 // The report window: frame times (present to present) and the counters above, logged every
@@ -3736,7 +3866,8 @@ void RecordUpscale(DeviceData* d, VkCommandBuffer cb, CmdState& cs) {
     VkImageAspectFlags depthAspects =
         VK_IMAGE_ASPECT_DEPTH_BIT | (HasStencil(di.fmt) ? VK_IMAGE_ASPECT_STENCIL_BIT : 0);
     const VkImageLayout RO = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    if (GpuPerfEnsure(d, cb)) GpuMark(d, cb, kGmStart);  // perf=1: GPU timings
+    GpuPerfEnsure(d, cb);  // perf=1: GPU timings
+    GpuMark(d, cb, kGmStart);
 
     // inputs -> read-only, output -> general
     if (colorLayout != RO) Barrier(d, cb, cs.colorImage, VK_IMAGE_ASPECT_COLOR_BIT, colorLayout, RO);
@@ -3795,6 +3926,7 @@ void RecordUpscale(DeviceData* d, VkCommandBuffer cb, CmdState& cs) {
         if (depthLayout != RO) Barrier(d, cb, cs.depthImage, depthAspects, RO, depthLayout);
         if (colorLayout != RO) Barrier(d, cb, cs.colorImage, VK_IMAGE_ASPECT_COLOR_BIT, RO, colorLayout);
         GpuFrameEnd(d, cb);
+        Checkpoint(d, cb, kGmEnd);
         RestoreGameState(d, cb, cs);
         return;
     } else if (g_dlss.mvLayout != RO) {  // no motion pass: zero motion vectors
@@ -4386,6 +4518,33 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_CreateDevice(VkPhysicalDevice physical
         ci.pNext = &bdaExt;
         Log("[device] bufferDeviceAddress feature switched on (for DLSS)");
     }
+    // gpu_crash_info: checkpoints (NVIDIA) and the fault report (VK_EXT_device_fault), where offered
+    auto hasExt = [&](const char* n) {
+        return std::any_of(exts.begin(), exts.end(), [&](const char* e) { return !std::strcmp(e, n); });
+    };
+    bool addCheckpoints = false, addFault = false;
+    VkPhysicalDeviceFaultFeaturesEXT faultFeat{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
+    bool crashInfo = g_cfg.gpuCrashInfo != 0;
+    if (crashInfo) {
+        addCheckpoints = supported.count(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME) &&
+                         !hasExt(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
+        if (addCheckpoints) exts.push_back(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
+        if (supported.count(VK_EXT_DEVICE_FAULT_EXTENSION_NAME) && !hasExt(VK_EXT_DEVICE_FAULT_EXTENSION_NAME) &&
+            inst && inst->GetPhysicalDeviceFeatures2 &&
+            !FindInChain(ci.pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT)) {
+            VkPhysicalDeviceFaultFeaturesEXT q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
+            VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+            f2.pNext = &q;
+            inst->GetPhysicalDeviceFeatures2(physicalDevice, &f2);
+            if (q.deviceFault) {
+                addFault = true;
+                exts.push_back(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+                faultFeat.deviceFault = VK_TRUE;
+                faultFeat.pNext = const_cast<void*>(ci.pNext);
+                ci.pNext = &faultFeat;
+            }
+        }
+    }
     FeaturePatch fp;
     size_t extsBeforeFsr = exts.size();
     bool fsrFeatures = wantFsr && inst && AddFsrFeatures(inst, physicalDevice, ci, exts, supported, fp);
@@ -4419,6 +4578,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_CreateDevice(VkPhysicalDevice physical
     DEVICE_HOOKS(X)
     DEVICE_CALLS(X)
 #undef X
+    d->checkpoints = extrasOk && addCheckpoints && d->CmdSetCheckpointNV && d->GetQueueCheckpointDataNV;
+    d->deviceFault = extrasOk && addFault && d->GetDeviceFaultInfoEXT;
+    if (crashInfo)
+        Log("[device] GPU crash info: checkpoints %s, fault report %s", d->checkpoints ? "on" : "not offered",
+            d->deviceFault ? "on" : "not offered");
     {
         TLock lk(g_t);
         if (!g_dlss.dev) {
@@ -5369,7 +5533,10 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_BeginCommandBuffer(VkCommandBuffer cb,
         PerfScope ps(kPerfState);
         CmdFor(cb) = CmdState{};
     }
-    return GetDevice(Key(cb))->BeginCommandBuffer(cb, pInfo);
+    DeviceData* d = GetDevice(Key(cb));
+    VkResult r = d->BeginCommandBuffer(cb, pInfo);
+    if (r == VK_SUCCESS) Checkpoint(d, cb, kCpGameCb);
+    return r;
 }
 
 static VKAPI_ATTR void VKAPI_CALL tf3_CmdBindPipeline(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipeline pipeline) {
@@ -5869,7 +6036,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_QueueSubmit(VkQueue queue, uint32_t su
                 }
     }
     DeviceData* d = GetDevice(Key(queue));
-    VkResult r = d->QueueSubmit(queue, submitCount, pSubmits, fence);
+    if (d->checkpoints) NoteQueue(queue);
+    VkResult r = CheckLost(d, d->QueueSubmit(queue, submitCount, pSubmits, fence), "vkQueueSubmit");
     std::vector<CaptureFrame> toWrite;
     {
         TLock lk(g_t);
@@ -6050,7 +6218,20 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_QueuePresentKHR(VkQueue queue, const V
         TLock lk(g_t);
         PerfPresent();  // perf=1: frame times, and the report every perf_seconds
     }
-    return GetDevice(Key(queue))->QueuePresentKHR(queue, pInfo);
+    DeviceData* d = GetDevice(Key(queue));
+    return CheckLost(d, d->QueuePresentKHR(queue, pInfo), "vkQueuePresentKHR");
+}
+
+// Only to notice a GPU crash (see ReportDeviceLost): the game usually learns of it here first.
+static VKAPI_ATTR VkResult VKAPI_CALL tf3_WaitForFences(VkDevice device, uint32_t count, const VkFence* pFences,
+                                                        VkBool32 waitAll, uint64_t timeout) {
+    DeviceData* d = GetDevice(Key(device));
+    return CheckLost(d, d->WaitForFences(device, count, pFences, waitAll, timeout), "vkWaitForFences");
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL tf3_GetFenceStatus(VkDevice device, VkFence fence) {
+    DeviceData* d = GetDevice(Key(device));
+    return CheckLost(d, d->GetFenceStatus(device, fence), "vkGetFenceStatus");
 }
 
 // =============================================================================================
