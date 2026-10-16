@@ -1131,6 +1131,9 @@ int main(int argc, char** argv) {
                                      nullptr, 0, nullptr, 1, &b);
             }
             begin(cb, part == 0 ? rpScene : rpSceneMore, fbScene, g.render);
+            // as in TF3: set 0 still holds a set of another layout (no colorMapDepthTex) when the terrain
+            // pipeline is bound; its own set follows right after
+            vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, plTex, 0, 1, &tonemapSet, 0, nullptr);
             vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pScene);
             vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, plScene, 0, 1, &viewSet[slot], 0, nullptr);
             VkDeviceSize zero = 0;
@@ -1319,7 +1322,8 @@ int main(int argc, char** argv) {
         AddCheck("image has content", stddev > 20, "brightness spread %.1f (a flat image means nothing was drawn)", stddev);
         AddCheck("UI on top", uiLum > 200, "UI panel brightness %.0f (should be about 230)", uiLum);
         bool contour = log.find("giving it the un-jittered depth") != std::string::npos &&
-                       log.find("the un-jittered depth was bound for terrain draws") != std::string::npos;
+                       log.find("the un-jittered depth was bound for terrain draws") != std::string::npos &&
+                       log.find("contour lines keep the game's depth") == std::string::npos;
         AddCheck("contour lines get un-jittered depth", contour,
                  contour ? "the log says the colorMapDepthTex draws were given the layer's un-jittered depth"
                          : "the log never says the colorMapDepthTex draws got the un-jittered depth");

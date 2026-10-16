@@ -4150,6 +4150,7 @@ struct ContourState {
     bool failed = false;
     uint64_t swaps = 0;  // draws swapped since the last log
     bool loggedFirst = false;
+    bool loggedSkip = false;
 } g_contour;
 
 bool ContourOn() {  // caller holds g_t
@@ -4204,8 +4205,18 @@ VkDescriptorSet ContourSet(DeviceData* d, VkDescriptorSet gameSet, uint32_t bind
         g_contour.failed = true;
         return VK_NULL_HANDLE;
     };
-    if (type != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER && type != VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE)
-        return giveUp("colorMapDepthTex has an unexpected descriptor type");
+    if (type != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER && type != VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE) {
+        // Usually the set still bound from the previous pipeline (the game rebinds it right after
+        // binding the terrain pipeline): skip it this time instead of giving up for good.
+        if (!g_contour.loggedSkip) {
+            g_contour.loggedSkip = true;
+            Log("[contour] frame %llu: set %s bound at the terrain set has %s at binding %u; skipping it until "
+                "the game binds the terrain's own set", (unsigned long long)frame, H(gameSet).c_str(),
+                type == VK_DESCRIPTOR_TYPE_MAX_ENUM ? "nothing" : ("type " + std::to_string((int)type)).c_str(),
+                binding);
+        }
+        return VK_NULL_HANDLE;
+    }
     if (!EnsureContourPools(d, lo->second)) return giveUp("couldn't create descriptor pools");
     if (g_contour.poolUab != (g_updateAfterBindLayouts.count(lo->second) != 0))
         return giveUp("the game's set layouts differ in update-after-bind");
