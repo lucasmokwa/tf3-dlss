@@ -445,6 +445,7 @@ struct InstanceData {
     X(CreateRenderPass2)                      \
     X(CreateRenderPass2KHR)                   \
     X(CreateSwapchainKHR)                     \
+    X(CreateBuffer)                           \
     X(DestroyBuffer)                          \
     X(AllocateMemory)                         \
     X(FreeMemory)                             \
@@ -489,7 +490,6 @@ struct InstanceData {
     X(CreateDescriptorPool)        \
     X(CmdClearColorImage)          \
     X(DeviceWaitIdle)              \
-    X(CreateBuffer)                \
     X(GetBufferMemoryRequirements) \
     X(CreatePipelineLayout)        \
     X(CreateComputePipelines)      \
@@ -497,6 +497,7 @@ struct InstanceData {
     X(CmdCopyBufferToImage)        \
     X(CmdPushConstants)            \
     X(CmdCopyBuffer)               \
+    X(CmdFillBuffer)               \
     X(CmdCopyImageToBuffer)        \
     X(QueueWaitIdle)               \
     X(DestroyFramebuffer)          \
@@ -721,8 +722,6 @@ struct CmdState {
     VkIndexType ibType = VK_INDEX_TYPE_UINT16;
     // object motion pass recorded in this command buffer; previous matrices are filled at submit
     std::vector<ObjDraw> objDraws;
-    uint32_t objSlot = 0;
-    bool objPending = false;
     // the blit search (OnDraw) only runs again when a descriptor set was bound since the last one
     uint32_t setsGen = 0, blitGen = UINT32_MAX;
     std::pair<int, int> blitHit{-1, -1};
@@ -1252,13 +1251,23 @@ struct Dlss {
     VkImageView objFbView = VK_NULL_HANDLE;
     VkShaderModule objVs = VK_NULL_HANDLE, objFs = VK_NULL_HANDLE;
     std::map<std::string, VkPipeline> objPipelines;  // keyed by vertex layout
-    VkBuffer objBuf = VK_NULL_HANDLE;  // previous-frame model matrices, kObjSlots x kObjMax x 64 bytes
-    char* objPtr = nullptr;
-    // the object pass's draw commands, kObjSlots x kObjMax: written at submit, with no instances for
-    // a draw none of whose instances moved (most of them: parked and waiting vehicles)
+    VkBuffer objBuf = VK_NULL_HANDLE;  // previous-frame model matrices, kObjMax x 64 bytes (obj_track.comp writes)
+    // the object pass's draw commands, kObjSlots x kObjMax: written with no instances when recorded;
+    // obj_track.comp gives a draw its instances if one of them moved (most don't: parked vehicles)
     VkBuffer objIndBuf = VK_NULL_HANDLE;
     char* objIndPtr = nullptr;
     uint64_t objCounter = 0;
+    // GPU matching (obj_track.comp): the game's instance data copied here each frame, the two track
+    // lists (last frame's, this frame's), the draw table and counters (kObjSlots of each, host-written)
+    VkBuffer objRawBuf = VK_NULL_HANDLE, objTrackBuf = VK_NULL_HANDLE;
+    VkBuffer objDrawBuf = VK_NULL_HANDLE, objStatsBuf = VK_NULL_HANDLE;
+    char* objDrawPtr = nullptr;
+    char* objStatsPtr = nullptr;
+    VkDescriptorSetLayout objTrackSetLayout = VK_NULL_HANDLE;
+    VkPipelineLayout objTrackPipeLayout = VK_NULL_HANDLE;
+    VkPipeline objTrackPipeline = VK_NULL_HANDLE;
+    VkDescriptorPool objTrackPool = VK_NULL_HANDLE;
+    VkDescriptorSet objTrackSet = VK_NULL_HANDLE;
     std::vector<VkDeviceMemory> memories;
 } g_dlss;
 
@@ -2553,17 +2562,33 @@ void RecordSharpen(DeviceData* d, VkCommandBuffer cb) {
 // ---------------------------------------------------------------------------------------------
 // Moving objects (vehicles...) only get camera motion from the compute pass. For meshes seen
 // moving recently, the scene draws are replayed into the motion-vector image with object_mv.vert/
-// .frag, which use this frame's model matrix (the game's instance data) and last frame's (matched
-// on the CPU: nearest copy of the same mesh, within kObjMatchDist).
+// .frag, which use this frame's model matrix (the game's instance data) and last frame's. The
+// matching happens on the GPU (obj_track.comp) from a GPU copy of the game's instance data, so the
+// CPU never reads that memory for it.
 const uint32_t kObjVsSpirv[] = {
 #include "object_mv_vert.spv.inc"
 };
 const uint32_t kObjFsSpirv[] = {
 #include "object_mv_frag.spv.inc"
 };
+const uint32_t kObjTrackSpirv[] = {
+#include "obj_track.spv.inc"
+};
 constexpr uint32_t kObjSlots = 16;  // see kMvSlots
 constexpr uint32_t kObjMax = 16384;      // instances per frame
+constexpr uint32_t kObjMaxDraws = 4096;  // draws per frame
+constexpr VkDeviceSize kObjRawBytes = 4u << 20;  // the game's instance data copied per frame
 constexpr float kObjMatchDist = 2.f;     // world units per frame
+// One replayed draw, for obj_track.comp (its `Draw`).
+struct ObjGpuDraw {
+    uint32_t rawOff, stride, col[4], instances, dst, cmd, prevStart, prevCount, pad;
+};
+static_assert(sizeof(ObjGpuDraw) == 48, "matches obj_track.comp");
+struct ObjTrackPush {
+    uint32_t drawBase, drawCount, instanceCount, prevBase, curBase, indBase, statsBase;
+    float matchDist;
+};
+constexpr uint32_t kObjTrackEntry = 80;  // obj_track.comp's Track: mat4 + vec4
 constexpr uint64_t kObjMeshKeep = 300;   // frames a mesh stays "moving" after it last moved
 
 std::unordered_map<uint64_t, uint64_t> g_movingMeshes;  // mesh -> last frame it was seen moving
@@ -2573,11 +2598,25 @@ struct ObjFrame {
     std::set<std::pair<VkBuffer, VkDeviceSize>> seen;  // depth prepass + colour pass draw the same
     uint32_t instances = 0;
 } g_objFrame;
-std::unordered_map<uint64_t, std::vector<std::array<float, 16>>> g_objPrev;  // mesh -> last frame's matrices
+// Last pass's instances on the GPU: mesh -> its range in the track list that pass wrote
+std::unordered_map<uint64_t, std::pair<uint32_t, uint32_t>> g_objPrevRanges;
 uint64_t g_objPrevFrame = UINT64_MAX;
+uint32_t g_objList = 0;  // the track list the last pass wrote (0 or 1)
 struct ObjStats {
     uint64_t frames = 0, draws = 0, drawn = 0, instances = 0, moved = 0, unmatched = 0;
 } g_objStats;
+struct ObjSlotInfo {  // what each slot's pass recorded, to count its results once the GPU is long done
+    uint64_t frame = 0;
+    uint32_t draws = 0, instances = 0;
+    bool counted = true;
+};
+ObjSlotInfo g_objSlotInfo[kObjSlots];
+// Game buffers by size and whether we may copy from them (vertex buffers get TRANSFER_SRC, see CreateBuffer)
+struct BufferDesc {
+    VkDeviceSize size = 0;
+    bool copyable = false;
+};
+std::unordered_map<VkBuffer, BufferDesc> g_bufferDesc;
 
 std::string ObjLayoutKey(const PipeVtx& p) {
     char k[160];
@@ -2618,15 +2657,74 @@ bool EnsureObjResources(DeviceData* d) {
     si.codeSize = sizeof kObjFsSpirv;
     si.pCode = kObjFsSpirv;
     if (d->CreateShaderModule(d->device, &si, nullptr, &g_dlss.objFs) != VK_SUCCESS) return false;
-    if (!CreateBuffer(d, (VkDeviceSize)kObjSlots * kObjMax * 64, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
-                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &g_dlss.objBuf,
-                      &g_dlss.objPtr))
+    const VkMemoryPropertyFlags host = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    if (!CreateBuffer(d, (VkDeviceSize)kObjMax * 64, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &g_dlss.objBuf, nullptr))
         return false;
     if (!CreateBuffer(d, (VkDeviceSize)kObjSlots * kObjMax * sizeof(VkDrawIndexedIndirectCommand),
-                      VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
-                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &g_dlss.objIndBuf,
-                      &g_dlss.objIndPtr))
+                      VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, host,
+                      &g_dlss.objIndBuf, &g_dlss.objIndPtr))
         return false;
+    if (!CreateBuffer(d, kObjRawBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &g_dlss.objRawBuf, nullptr) ||
+        !CreateBuffer(d, (VkDeviceSize)2 * kObjMax * kObjTrackEntry, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &g_dlss.objTrackBuf, nullptr) ||
+        !CreateBuffer(d, (VkDeviceSize)kObjSlots * kObjMaxDraws * sizeof(ObjGpuDraw), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                      host, &g_dlss.objDrawBuf, &g_dlss.objDrawPtr) ||
+        !CreateBuffer(d, (VkDeviceSize)kObjSlots * 4 * sizeof(uint32_t), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, host,
+                      &g_dlss.objStatsBuf, &g_dlss.objStatsPtr))
+        return false;
+    {   // obj_track.comp
+        VkDescriptorSetLayoutBinding tb[6] = {};
+        for (uint32_t i = 0; i < 6; ++i)
+            tb[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+        VkDescriptorSetLayoutCreateInfo tli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        tli.bindingCount = 6;
+        tli.pBindings = tb;
+        if (d->CreateDescriptorSetLayout(d->device, &tli, nullptr, &g_dlss.objTrackSetLayout) != VK_SUCCESS) return false;
+        VkPushConstantRange pr{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(ObjTrackPush)};
+        VkPipelineLayoutCreateInfo tpl{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        tpl.setLayoutCount = 1;
+        tpl.pSetLayouts = &g_dlss.objTrackSetLayout;
+        tpl.pushConstantRangeCount = 1;
+        tpl.pPushConstantRanges = &pr;
+        if (d->CreatePipelineLayout(d->device, &tpl, nullptr, &g_dlss.objTrackPipeLayout) != VK_SUCCESS) return false;
+        VkShaderModuleCreateInfo tsi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        tsi.codeSize = sizeof kObjTrackSpirv;
+        tsi.pCode = kObjTrackSpirv;
+        VkShaderModule mod;
+        if (d->CreateShaderModule(d->device, &tsi, nullptr, &mod) != VK_SUCCESS) return false;
+        VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        ci.stage.module = mod;
+        ci.stage.pName = "main";
+        ci.layout = g_dlss.objTrackPipeLayout;
+        VkResult cr = d->CreateComputePipelines(d->device, VK_NULL_HANDLE, 1, &ci, nullptr, &g_dlss.objTrackPipeline);
+        d->DestroyShaderModule(d->device, mod, nullptr);
+        if (cr != VK_SUCCESS) return false;
+        VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 6};
+        VkDescriptorPoolCreateInfo tpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        tpi.maxSets = 1;
+        tpi.poolSizeCount = 1;
+        tpi.pPoolSizes = &ps;
+        if (d->CreateDescriptorPool(d->device, &tpi, nullptr, &g_dlss.objTrackPool) != VK_SUCCESS) return false;
+        VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        ai.descriptorPool = g_dlss.objTrackPool;
+        ai.descriptorSetCount = 1;
+        ai.pSetLayouts = &g_dlss.objTrackSetLayout;
+        if (d->AllocateDescriptorSets(d->device, &ai, &g_dlss.objTrackSet) != VK_SUCCESS) return false;
+        VkBuffer bufs[6] = {g_dlss.objRawBuf, g_dlss.objDrawBuf, g_dlss.objTrackBuf,
+                            g_dlss.objBuf,    g_dlss.objIndBuf,  g_dlss.objStatsBuf};
+        VkDescriptorBufferInfo bi[6];
+        VkWriteDescriptorSet w[6] = {};
+        for (uint32_t i = 0; i < 6; ++i) {
+            bi[i] = {bufs[i], 0, VK_WHOLE_SIZE};
+            w[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, g_dlss.objTrackSet, i, 0, 1,
+                    VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &bi[i], nullptr};
+        }
+        d->UpdateDescriptorSets(d->device, 6, w, 0, nullptr);
+    }
     VkAttachmentDescription att{};
     att.format = VK_FORMAT_R16G16_SFLOAT;
     att.samples = VK_SAMPLE_COUNT_1_BIT;
@@ -2788,7 +2886,7 @@ void ObjRecordDraw(CmdState& cs, uint64_t mesh, bool indexed, uint32_t count, ui
     od.mdlOff = cs.vb[pv.mdlBinding].second + (VkDeviceSize)firstInstance * pv.stride;
     if (!od.posBuf || !od.mdlBuf || (indexed && !cs.ib)) return;
     if (!g_objFrame.seen.insert({od.mdlBuf, od.mdlOff}).second) return;
-    if (g_objFrame.instances + instanceCount > kObjMax) return;
+    if (g_objFrame.instances + instanceCount > kObjMax || g_objFrame.draws.size() >= kObjMaxDraws) return;
     od.ib = cs.ib;
     od.ibOff = cs.ibOff;
     od.ibType = cs.ibType;
@@ -2848,7 +2946,131 @@ bool RecordObjectPass(DeviceData* d, VkCommandBuffer cb, CmdState& cs, VkImageVi
         }
         g_dlss.objFbView = g_dlss.mvView;
     }
-    uint32_t slot = (uint32_t)(g_dlss.objCounter++ % kObjSlots);
+    uint32_t slot = (uint32_t)(g_dlss.objCounter % kObjSlots);
+
+    // Results of the pass that last used this slot (kObjSlots passes ago, long finished), for the log.
+    ObjSlotInfo& si = g_objSlotInfo[slot];
+    auto* stats = reinterpret_cast<uint32_t*>(g_dlss.objStatsPtr) + slot * 4;
+    auto* cmds = reinterpret_cast<VkDrawIndexedIndirectCommand*>(g_dlss.objIndPtr) + (size_t)slot * kObjMax;
+    if (!si.counted) {
+        uint64_t drawn = 0;
+        for (uint32_t c = 0; c < si.draws; ++c) drawn += cmds[c].instanceCount != 0;
+        ++g_objStats.frames;
+        g_objStats.draws += si.draws;
+        g_objStats.drawn += drawn;
+        g_objStats.instances += si.instances;
+        g_objStats.moved += stats[0];
+        g_objStats.unmatched += stats[1];
+        if (LogFrame(g_frame))
+            Log("[obj] frame %llu: %u draws (%llu with moving instances drawn), %u instances of %zu moving meshes; "
+                "%u moved, %u unmatched (totals: %llu frames, %llu instances, %llu moved)",
+                (unsigned long long)si.frame, si.draws, (unsigned long long)drawn, si.instances,
+                g_movingMeshes.size(), stats[0], stats[1], (unsigned long long)g_objStats.frames,
+                (unsigned long long)g_objStats.instances, (unsigned long long)g_objStats.moved);
+        si.counted = true;
+    }
+
+    // Same mesh next to each other, so that each mesh is one range in the track list.
+    thread_local std::vector<ObjDraw> sorted;
+    sorted = g_objFrame.draws;
+    std::stable_sort(sorted.begin(), sorted.end(), [](const ObjDraw& a, const ObjDraw& b) { return a.mesh < b.mesh; });
+    bool havePrev = g_objPrevFrame != UINT64_MAX && g_objPrevFrame + 1 == g_frame;
+    auto* table = reinterpret_cast<ObjGpuDraw*>(g_dlss.objDrawPtr) + (size_t)slot * kObjMaxDraws;
+    thread_local std::vector<std::pair<VkBuffer, VkBufferCopy>> copies;
+    copies.clear();
+    std::unordered_map<uint64_t, std::pair<uint32_t, uint32_t>> ranges;
+    VkDeviceSize raw = 0;
+    uint32_t next = 0;
+    cs.objDraws.clear();
+    static int skipLogged = 0;
+    for (ObjDraw od : sorted) {
+        if (!ObjPipeline(d, od.layout)) continue;
+        const PipeVtx& pv = od.layout;
+        VkDeviceSize span = 0;
+        for (int c = 0; c < 4; ++c) span = std::max<VkDeviceSize>(span, (VkDeviceSize)pv.colOffset[c] + 16);
+        span += (VkDeviceSize)(od.instances - 1) * pv.stride;
+        // Only what the game's own draw reads, from a buffer we may copy from.
+        auto bd = g_bufferDesc.find(od.mdlBuf);
+        bool ok = bd != g_bufferDesc.end() && bd->second.copyable && od.mdlOff <= bd->second.size &&
+                  span <= bd->second.size - od.mdlOff && pv.stride % 4 == 0;
+        for (int c = 0; c < 4; ++c) ok = ok && pv.colOffset[c] % 4 == 0;
+        if (!ok) {
+            if (skipLogged++ < 5)
+                Log("[obj] skipping a draw: its instance data can't be copied (buffer %s, offset %llu, %llu bytes)",
+                    H(od.mdlBuf).c_str(), (unsigned long long)od.mdlOff, (unsigned long long)span);
+            continue;
+        }
+        VkDeviceSize at = (raw + 15) & ~(VkDeviceSize)15;
+        if (at + span > kObjRawBytes) break;
+        raw = at + span;
+        copies.push_back({od.mdlBuf, VkBufferCopy{od.mdlOff, at, span}});
+        od.dst = next;
+        next += od.instances;
+        od.cmd = (uint32_t)cs.objDraws.size();
+        auto rg = ranges.try_emplace(od.mesh, od.dst, 0).first;
+        rg->second.second += od.instances;  // contiguous: sorted by mesh
+        uint32_t prevStart = 0, prevCount = 0;
+        if (havePrev) {
+            auto pr = g_objPrevRanges.find(od.mesh);
+            if (pr != g_objPrevRanges.end()) prevStart = pr->second.first, prevCount = pr->second.second;
+        }
+        table[od.cmd] = ObjGpuDraw{(uint32_t)(at / 4), pv.stride / 4,
+                                   {pv.colOffset[0] / 4, pv.colOffset[1] / 4, pv.colOffset[2] / 4, pv.colOffset[3] / 4},
+                                   od.instances, od.dst, od.cmd, prevStart, prevCount, 0};
+        // Indirect with no instances: obj_track.comp gives the draw its instances if one of them moved.
+        // Until then it draws nothing, also if this command buffer is never submitted.
+        if (od.indexed) cmds[od.cmd] = {od.count, 0, od.first, od.vertexOffset, 0};
+        else *reinterpret_cast<VkDrawIndirectCommand*>(&cmds[od.cmd]) = {od.count, 0, od.first, 0};
+        cs.objDraws.push_back(od);
+    }
+    if (cs.objDraws.empty()) return false;
+    ++g_dlss.objCounter;
+    stats[0] = stats[1] = 0;
+    si = ObjSlotInfo{g_frame, (uint32_t)cs.objDraws.size(), next, false};
+    uint32_t list = g_objList ^ 1;  // this pass writes this list and reads the other one (last pass's)
+
+    // 1. Copy the game's instance data (one copy command per buffer). Earlier passes' reads of our
+    // buffers (vertex input, indirect, compute) must be done before we overwrite them.
+    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    mb.srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT |
+                                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                          VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr,
+                          0, nullptr);
+    std::stable_sort(copies.begin(), copies.end(),
+                     [](const auto& a, const auto& b) { return (uintptr_t)a.first < (uintptr_t)b.first; });
+    thread_local std::vector<VkBufferCopy> regions;
+    for (size_t i = 0; i < copies.size();) {
+        size_t j = i;
+        regions.clear();
+        for (; j < copies.size() && copies[j].first == copies[i].first; ++j) regions.push_back(copies[j].second);
+        d->CmdCopyBuffer(cb, copies[i].first, g_dlss.objRawBuf, (uint32_t)regions.size(), regions.data());
+        i = j;
+    }
+    mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0,
+                          nullptr, 0, nullptr);
+
+    // 2. Match every instance with last frame's (obj_track.comp).
+    ObjTrackPush pc{slot * kObjMaxDraws, (uint32_t)cs.objDraws.size(), next, (list ^ 1) * kObjMax, list * kObjMax,
+                    slot * kObjMax * 5, slot * 4, kObjMatchDist};
+    d->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_dlss.objTrackPipeline);
+    d->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_dlss.objTrackPipeLayout, 0, 1, &g_dlss.objTrackSet, 0,
+                             nullptr);
+    d->CmdPushConstants(cb, g_dlss.objTrackPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
+    d->CmdDispatch(cb, (next + 63) / 64, 1, 1);
+    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT;
+    d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                          VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, 0, 1, &mb, 0,
+                          nullptr, 0, nullptr);
+    g_objPrevRanges = std::move(ranges);
+    g_objPrevFrame = g_frame;
+    g_objList = list;
+
+    // 3. Replay the draws into the motion-vector image.
     Barrier(d, cb, g_dlss.mvImage, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
             VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     VkRenderPassBeginInfo rb{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
@@ -2867,127 +3089,27 @@ bool RecordObjectPass(DeviceData* d, VkCommandBuffer cb, CmdState& cs, VkImageVi
     d->CmdSetViewport(cb, 0, 1, &vp);
     d->CmdSetScissor(cb, 0, 1, &sc);
     d->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_dlss.objPipeLayout, 0, 1, &g_dlss.objSet, 1, &dyn);
-    cs.objDraws.clear();
-    uint32_t next = 0;
     VkPipeline bound = VK_NULL_HANDLE;
-    for (ObjDraw od : g_objFrame.draws) {
+    for (const ObjDraw& od : cs.objDraws) {
         VkPipeline pipe = ObjPipeline(d, od.layout);
-        if (!pipe) continue;
         if (pipe != bound) {
             d->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
             bound = pipe;
         }
-        od.dst = next;
-        next += od.instances;
-        od.cmd = (uint32_t)cs.objDraws.size();
         VkBuffer bufs[3] = {od.posBuf, od.mdlBuf, g_dlss.objBuf};
-        VkDeviceSize offs[3] = {od.posOff, od.mdlOff, ((VkDeviceSize)slot * kObjMax + od.dst) * 64};
+        VkDeviceSize offs[3] = {od.posOff, od.mdlOff, (VkDeviceSize)od.dst * 64};
         d->CmdBindVertexBuffers(cb, 0, 3, bufs, offs);
-        // Indirect, so that ObjFillPrev can drop the draw at submit if none of its instances moved. Until
-        // then it draws nothing, also if this command buffer is never submitted.
         VkDeviceSize cmdOff = ((VkDeviceSize)slot * kObjMax + od.cmd) * sizeof(VkDrawIndexedIndirectCommand);
-        auto* ic = reinterpret_cast<VkDrawIndexedIndirectCommand*>(g_dlss.objIndPtr + cmdOff);
         if (od.indexed) {
-            *ic = {od.count, 0, od.first, od.vertexOffset, 0};
             d->CmdBindIndexBuffer(cb, od.ib, od.ibOff, od.ibType);
             d->CmdDrawIndexedIndirect(cb, g_dlss.objIndBuf, cmdOff, 1, sizeof(VkDrawIndexedIndirectCommand));
         } else {
-            *reinterpret_cast<VkDrawIndirectCommand*>(ic) = {od.count, 0, od.first, 0};
             d->CmdDrawIndirect(cb, g_dlss.objIndBuf, cmdOff, 1, sizeof(VkDrawIndexedIndirectCommand));
         }
-        cs.objDraws.push_back(od);
     }
     d->CmdEndRenderPass(cb);
     g_dlss.objSetUsed = true;
-    cs.objSlot = slot;
-    cs.objPending = !cs.objDraws.empty();
     return true;
-}
-
-// At submit: fill last frame's model matrix for every replayed instance (or this frame's when the
-// object can't be matched, which leaves it with camera motion only).
-void ObjFillPrev(CmdState& cs) {
-    if (!cs.objPending || !g_dlss.objPtr) return;
-    cs.objPending = false;
-    bool havePrev = g_objPrevFrame != UINT64_MAX && g_objPrevFrame + 1 == g_frame;
-    std::unordered_map<uint64_t, std::vector<std::array<float, 16>>> next;
-    uint64_t moved = 0, unmatched = 0, total = 0;
-    char* base = g_dlss.objPtr + (size_t)cs.objSlot * kObjMax * 64;
-    // last frame's copies by exact position: parked/stopped copies are found without a search
-    auto exactKey = [](uint64_t mesh, const float* m) {
-        uint32_t x, y, z;
-        std::memcpy(&x, &m[12], 4);
-        std::memcpy(&y, &m[13], 4);
-        std::memcpy(&z, &m[14], 4);
-        return Mix(Mix(Mix(mesh, x), y), z);
-    };
-    std::unordered_map<uint64_t, const float*> exact;
-    if (havePrev)
-        for (const auto& [mesh, list] : g_objPrev)
-            for (const auto& m : list) exact.emplace(exactKey(mesh, m.data()), m.data());
-    uint64_t drawn = 0;
-    thread_local std::vector<char> copy;  // this draw's instance data, read out of the game's memory at once
-    for (const ObjDraw& od : cs.objDraws) {
-        size_t span = 0;
-        for (int c = 0; c < 4; ++c) span = std::max(span, (size_t)od.layout.colOffset[c] + 16);
-        if (od.instances) span += (size_t)(od.instances - 1) * od.layout.stride;
-        char* src = od.instances ? RefData(od.mdlBuf, od.mdlOff, span) : nullptr;  // all of it, or none
-        if (src) {
-            copy.resize(span);
-            CopyFromMapped(copy.data(), src, span);
-            src = copy.data();
-        }
-        auto& list = next[od.mesh];
-        auto pp = havePrev ? g_objPrev.find(od.mesh) : g_objPrev.end();
-        bool anyMoved = false;
-        for (uint32_t i = 0; i < od.instances; ++i) {
-            float cur[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
-            if (src)
-                for (int c = 0; c < 4; ++c)
-                    std::memcpy(cur + c * 4, src + (size_t)i * od.layout.stride + od.layout.colOffset[c], 16);
-            const float* prev = cur;
-            auto ex = src && havePrev ? exact.find(exactKey(od.mesh, cur)) : exact.end();
-            if (ex != exact.end()) prev = ex->second;
-            else if (src && pp != g_objPrev.end()) {
-                float best = kObjMatchDist * kObjMatchDist;
-                for (const auto& m : pp->second) {
-                    float dx = m[12] - cur[12], dy = m[13] - cur[13], dz = m[14] - cur[14];
-                    float d2 = dx * dx + dy * dy + dz * dz;
-                    if (d2 < best) best = d2, prev = m.data();
-                }
-            }
-            if (prev == cur) ++unmatched;
-            else if (std::memcmp(prev, cur, 64) != 0) ++moved, anyMoved = true;
-            std::memcpy(base + (size_t)(od.dst + i) * 64, prev, 64);
-            std::array<float, 16> a;
-            std::memcpy(a.data(), cur, 64);
-            list.push_back(a);
-            ++total;
-        }
-        // Only draws with a moving instance: for the others, the camera pass already has the full motion.
-        // (object_mv.vert drops the instances that didn't move in the draws that remain.)
-        if (anyMoved) {
-            auto* ic = reinterpret_cast<VkDrawIndexedIndirectCommand*>(
-                g_dlss.objIndPtr + ((size_t)cs.objSlot * kObjMax + od.cmd) * sizeof(VkDrawIndexedIndirectCommand));
-            ic->instanceCount = od.instances;  // the same field in VkDrawIndirectCommand
-            ++drawn;
-        }
-    }
-    g_objPrev = std::move(next);
-    g_objPrevFrame = g_frame;
-    ++g_objStats.frames;
-    g_objStats.draws += cs.objDraws.size();
-    g_objStats.drawn += drawn;
-    g_objStats.instances += total;
-    g_objStats.moved += moved;
-    g_objStats.unmatched += unmatched;
-    if (LogFrame(g_frame))
-        Log("[obj] frame %llu: %zu draws (%llu with moving instances drawn), %llu instances of %zu moving "
-            "meshes; %llu moved, %llu unmatched (totals: %llu frames, %llu instances, %llu moved)",
-            (unsigned long long)g_frame, cs.objDraws.size(), (unsigned long long)drawn, (unsigned long long)total,
-            g_movingMeshes.size(),
-            (unsigned long long)moved, (unsigned long long)unmatched, (unsigned long long)g_objStats.frames,
-            (unsigned long long)g_objStats.instances, (unsigned long long)g_objStats.moved);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -5968,11 +6090,31 @@ static VKAPI_ATTR void VKAPI_CALL tf3_FreeMemory(VkDevice device, VkDeviceMemory
     }
     GetDevice(Key(device))->FreeMemory(device, memory, pAllocator);
 }
+// Vertex buffers also get TRANSFER_SRC: the object motion pass copies the instance data of moving
+// objects on the GPU (RecordObjectPass) rather than reading it on the CPU. If the driver refuses the
+// extra usage, the buffer is created as the game asked and those draws keep camera motion only.
+static VKAPI_ATTR VkResult VKAPI_CALL tf3_CreateBuffer(VkDevice device, const VkBufferCreateInfo* pInfo,
+                                                       const VkAllocationCallbacks* pAllocator, VkBuffer* pBuffer) {
+    DeviceData* d = GetDevice(Key(device));
+    VkBufferCreateInfo info = *pInfo;
+    if (info.usage & VK_BUFFER_USAGE_VERTEX_BUFFER_BIT) info.usage |= VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    VkResult r = d->CreateBuffer(device, &info, pAllocator, pBuffer);
+    if (r != VK_SUCCESS && info.usage != pInfo->usage) {
+        info = *pInfo;
+        r = d->CreateBuffer(device, &info, pAllocator, pBuffer);
+    }
+    if (r == VK_SUCCESS) {
+        TLock lk(g_t);
+        g_bufferDesc[*pBuffer] = BufferDesc{info.size, (info.usage & VK_BUFFER_USAGE_TRANSFER_SRC_BIT) != 0};
+    }
+    return r;
+}
 static VKAPI_ATTR void VKAPI_CALL tf3_DestroyBuffer(VkDevice device, VkBuffer buffer,
                                                     const VkAllocationCallbacks* pAllocator) {
     if (buffer) {
         TLock lk(g_t);
         g_buffers.erase(buffer);
+        g_bufferDesc.erase(buffer);
     }
     GetDevice(Key(device))->DestroyBuffer(device, buffer, pAllocator);
 }
@@ -6288,6 +6430,7 @@ static VKAPI_ATTR void VKAPI_CALL tf3_CmdBeginRenderPass2KHR(VkCommandBuffer cb,
 }
 
 // After a render pass ends: apply its final layouts, and if it was RCAS's pass, run DLSS.
+void ProbeRecordCopies(DeviceData* d, VkCommandBuffer cb, CmdState& cs);
 static void AfterEndRp(DeviceData* d, VkCommandBuffer cb) {
     TLock lk(g_t);
     auto& cs = CmdFor(cb);
@@ -6308,6 +6451,10 @@ static void AfterEndRp(DeviceData* d, VkCommandBuffer cb) {
             for (size_t i = 0; i < imgs.size() && i < rp->second.finalLayouts.size(); ++i)
                 if (imgs[i]) SetLayout(cs, imgs[i], rp->second.finalLayouts[i]);
         }
+    }
+    if (!cs.probes.empty()) {
+        PerfScope ps(kPerfPass);
+        ProbeRecordCopies(d, cb, cs);
     }
     if (cs.rcasInThisPass) {
         cs.rcasInThisPass = false;
@@ -6463,7 +6610,7 @@ struct ProbeFrameData {
 };
 ProbeFrameData g_probeCur, g_probePrev;
 
-// No lock needed: fills this command buffer's list, read at submit.
+// No lock needed: fills this command buffer's list, copied at the end of the render pass.
 void ProbeDraw(CmdState& cs, bool indexed, uint32_t count, uint32_t instanceCount, uint32_t first,
                int32_t vertexOffset, uint32_t firstInstance) {
     if (!g_hot.probe.load(std::memory_order_relaxed)) return;
@@ -6485,39 +6632,141 @@ void ProbeDraw(CmdState& cs, bool indexed, uint32_t count, uint32_t instanceCoun
     if (p.buf && cs.probes.size() < 20000) cs.probes.push_back(p);
 }
 
-// At submit, when the game has finished writing this frame's instance data: just the translations.
-void ProbeCollect(CmdState& cs) {
-    if (cs.probes.empty()) return;
-    if (g_probeCur.frame != g_frame) {
-        g_probeCur = ProbeFrameData{};
-        g_probeCur.frame = g_frame;
+// The probe's reads go through the GPU as well: at the end of each scene render pass of a probe frame,
+// the instance data of that pass's draws is copied (vkCmdCopyBuffer) into a host-visible buffer, and
+// read back on the CPU a few frames later, once the GPU has written every batch's done-flag. The CPU
+// never reads the game's (write-combined) memory for it.
+constexpr VkDeviceSize kProbeBytes = 16u << 20;  // per probe frame
+constexpr uint32_t kProbeMaxBatches = 256;        // render passes with probed draws, per probe frame
+constexpr VkDeviceSize kProbeHeader = kProbeMaxBatches * 4;  // a done-flag per batch
+struct ProbeCopy {
+    VkBuffer buf;
+    VkDeviceSize base;  // bound offset of instance 0
+    uint32_t first, count, stride, col3;
+    uint64_t mesh;
+    VkDeviceSize at;    // where its instances landed in the slot
+};
+struct ProbeSlot {  // one per probe frame in flight: the two of a probe (f % kProbeEvery == 0, 1)
+    uint64_t frame = UINT64_MAX;
+    VkDeviceSize used = kProbeHeader;
+    uint32_t batches = 0;
+    bool full = false;
+    std::vector<ProbeCopy> copies;
+};
+ProbeSlot g_probeSlots[2];
+VkBuffer g_probeBuf = VK_NULL_HANDLE;
+char* g_probePtr = nullptr;
+bool g_probeTried = false;
+std::map<uint64_t, ProbeFrameData> g_probeRead;  // probe frames read back, waiting for their pair
+
+bool EnsureProbeBuffer(DeviceData* d) {
+    if (g_probeTried) return g_probeBuf != VK_NULL_HANDLE;
+    g_probeTried = true;
+    const VkMemoryPropertyFlags host = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    // cached host memory if there is some: the CPU reads it back
+    if (!CreateBuffer(d, 2 * kProbeBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, host | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+                      &g_probeBuf, &g_probePtr) &&
+        !CreateBuffer(d, 2 * kProbeBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, host, &g_probeBuf, &g_probePtr)) {
+        g_probeBuf = VK_NULL_HANDLE;
+        Log("[obj] couldn't create the probe buffer; moving objects won't be found");
+        return false;
     }
-    for (const ObjProbe& p : cs.probes) {
-        // read the instances in one go (see CopyFromMapped), as many whole ones as the mapping holds
-        auto bi = g_buffers.find(p.buf);
-        if (bi == g_buffers.end() || !p.stride) continue;
-        auto mi = g_mapped.find(bi->second.memory);
-        if (mi == g_mapped.end()) continue;
-        const Mapping& mp = mi->second;
-        VkDeviceSize at = bi->second.memOffset + p.base + (VkDeviceSize)p.first * p.stride;  // first instance
-        VkDeviceSize need = (VkDeviceSize)p.colOffset[3] + 12;  // bytes of one instance up to its translation
-        if (at < mp.offset || at > mp.end || mp.end - at < need) continue;
-        uint32_t n = std::min<VkDeviceSize>({p.count, 4096u, (mp.end - at - need) / p.stride + 1});
-        VkDeviceSize span = (VkDeviceSize)(n - 1) * p.stride + need;
-        char* base = RefData(p.buf, p.base + (VkDeviceSize)p.first * p.stride, span);
-        if (!base) continue;
-        thread_local std::vector<char> copy;
-        copy.resize((size_t)span);
-        CopyFromMapped(copy.data(), base, copy.size());
-        for (uint32_t i = 0; i < n; ++i) {
-            VkDeviceSize off = (VkDeviceSize)(p.first + i) * p.stride;
-            if (!g_probeCur.seen.insert(Mix((uint64_t)(uintptr_t)p.buf, p.base + off)).second) continue;
-            float t[3];
-            std::memcpy(t, copy.data() + (size_t)i * p.stride + p.colOffset[3], 12);  // translation = 4th column
-            g_probeCur.inst.push_back({p.mesh, t[0], t[1], t[2]});
+    return true;
+}
+
+// After a scene render pass of a probe frame (outside it): copy its probed draws' instance data. Caller holds g_t.
+void ProbeRecordCopies(DeviceData* d, VkCommandBuffer cb, CmdState& cs) {
+    if (cs.probes.empty()) return;
+    thread_local std::vector<std::pair<VkBuffer, VkBufferCopy>> copies;
+    copies.clear();
+    ProbeSlot& sl = g_probeSlots[g_frame & 1];
+    if (EnsureProbeBuffer(d) && d->CmdCopyBuffer) {
+        if (sl.frame != g_frame) sl = ProbeSlot{g_frame};
+        if (sl.batches < kProbeMaxBatches) {
+            VkDeviceSize slotBase = (g_frame & 1) * kProbeBytes;
+            for (const ObjProbe& p : cs.probes) {
+                if (!p.stride || p.colOffset[3] % 4) continue;
+                auto bd = g_bufferDesc.find(p.buf);
+                uint32_t n = std::min(p.count, 4096u);
+                if (bd == g_bufferDesc.end() || !bd->second.copyable || !n) continue;
+                VkDeviceSize from = p.base + (VkDeviceSize)p.first * p.stride;
+                VkDeviceSize span = (VkDeviceSize)(n - 1) * p.stride + p.colOffset[3] + 12;
+                if (from > bd->second.size || span > bd->second.size - from) continue;  // only what the game's draw reads
+                VkDeviceSize at = (sl.used + 15) & ~(VkDeviceSize)15;
+                if (at + span > kProbeBytes) {
+                    if (!sl.full) Log("[obj] probe frame %llu: more instances than fit; some aren't checked",
+                                      (unsigned long long)g_frame);
+                    sl.full = true;
+                    break;
+                }
+                sl.used = at + span;
+                copies.push_back({p.buf, VkBufferCopy{from, slotBase + at, span}});
+                sl.copies.push_back(ProbeCopy{p.buf, p.base, p.first, n, p.stride, p.colOffset[3], p.mesh, at});
+            }
+            if (!copies.empty()) {
+                std::stable_sort(copies.begin(), copies.end(),
+                                 [](const auto& a, const auto& b) { return (uintptr_t)a.first < (uintptr_t)b.first; });
+                thread_local std::vector<VkBufferCopy> regions;
+                for (size_t i = 0; i < copies.size();) {
+                    size_t j = i;
+                    regions.clear();
+                    for (; j < copies.size() && copies[j].first == copies[i].first; ++j) regions.push_back(copies[j].second);
+                    d->CmdCopyBuffer(cb, copies[i].first, g_probeBuf, (uint32_t)regions.size(), regions.data());
+                    i = j;
+                }
+                // then this batch's done-flag, then make both visible to the CPU
+                uint32_t batch = sl.batches++;
+                reinterpret_cast<uint32_t*>(g_probePtr + slotBase)[batch] = 0;
+                VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+                mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                mb.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0,
+                                      nullptr, 0, nullptr);
+                d->CmdFillBuffer(cb, g_probeBuf, slotBase + (VkDeviceSize)batch * 4, 4, 1u);
+                mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+                d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0,
+                                      nullptr, 0, nullptr);
+            }
         }
     }
     cs.probes.clear();
+}
+
+// At present: read back the probe frames the GPU has finished (all their batches' flags set).
+void ProbePoll() {
+    if (!g_probePtr) return;
+    for (int s = 0; s < 2; ++s) {
+        ProbeSlot& sl = g_probeSlots[s];
+        if (sl.frame == UINT64_MAX || sl.frame >= g_frame) continue;  // still recording
+        const char* base = g_probePtr + (VkDeviceSize)s * kProbeBytes;
+        bool done = true;
+        for (uint32_t b = 0; b < sl.batches && done; ++b) {
+            uint32_t v;
+            std::memcpy(&v, base + b * 4, 4);
+            done = v == 1u;
+        }
+        if (!done) {
+            if (g_frame > sl.frame + 20) sl = ProbeSlot{};  // a command buffer that was never submitted
+            continue;
+        }
+        ProbeFrameData& fd = g_probeRead[sl.frame];
+        fd.frame = sl.frame;
+        thread_local std::vector<char> copy;
+        for (const ProbeCopy& c : sl.copies) {
+            VkDeviceSize span = (VkDeviceSize)(c.count - 1) * c.stride + c.col3 + 12;
+            copy.resize((size_t)span);
+            CopyFromMapped(copy.data(), base + c.at, (size_t)span);  // plain loads if the memory is cached
+            for (uint32_t i = 0; i < c.count; ++i) {
+                VkDeviceSize off = (VkDeviceSize)(c.first + i) * c.stride;
+                if (!fd.seen.insert(Mix((uint64_t)(uintptr_t)c.buf, c.base + off)).second) continue;
+                float t[3];
+                std::memcpy(t, copy.data() + (size_t)i * c.stride + c.col3, 12);  // translation = 4th column
+                fd.inst.push_back({c.mesh, t[0], t[1], t[2]});
+            }
+        }
+        sl = ProbeSlot{};
+    }
+    while (g_probeRead.size() > 2) g_probeRead.erase(g_probeRead.begin());
 }
 
 uint64_t PosKey(const ProbePos& p) {
@@ -6528,10 +6777,19 @@ uint64_t PosKey(const ProbePos& p) {
     return Mix(Mix(Mix(p.mesh, x), y), z);
 }
 
-// At present: find meshes with a copy that moved between the two probed frames.
+// At present: find meshes with a copy that moved between the two probed frames (once both are read back).
 void ProbeReport() {
-    if (g_probeCur.frame != g_frame) return;
-    if (g_probePrev.frame + 1 == g_frame) {
+    ProbePoll();
+    if (g_probeRead.size() < 2) return;
+    auto second = std::next(g_probeRead.begin());
+    if (g_probeRead.begin()->first + 1 != second->first) {
+        g_probeRead.erase(g_probeRead.begin());  // not a pair (one of them was lost)
+        return;
+    }
+    g_probePrev = std::move(g_probeRead.begin()->second);
+    g_probeCur = std::move(second->second);
+    g_probeRead.clear();
+    {
         for (auto it = g_movingMeshes.begin(); it != g_movingMeshes.end();)
             if (it->second + kObjMeshKeep < g_frame) it = g_movingMeshes.erase(it);
             else ++it;
@@ -6566,7 +6824,7 @@ void ProbeReport() {
             Log("[obj] frame %llu: %zu instances, %u in place, %u moved; %zu meshes tracked as moving",
                 (unsigned long long)g_frame, g_probeCur.inst.size(), still, moved, g_movingMeshes.size());
     }
-    g_probePrev = std::move(g_probeCur);
+    g_probePrev = ProbeFrameData{};
     g_probeCur = ProbeFrameData{};
 }
 
@@ -6692,8 +6950,6 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_QueueSubmit(VkQueue queue, uint32_t su
                     UploadMvMatrices(cs);
                     cs.mvPending = false;
                 }
-                ObjFillPrev(cs);
-                ProbeCollect(cs);
             }
         if (LogFrame(g_frame) && g_lastViewLogFrame != g_frame)
             for (uint32_t s = 0; s < submitCount && g_lastViewLogFrame != g_frame; ++s)
