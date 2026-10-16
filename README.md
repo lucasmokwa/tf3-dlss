@@ -130,6 +130,9 @@ layer does with them:
   moving in front of a wall, match the exact values to within 0.02 px;
 - no Khronos validation errors;
 - its CPU time per frame with and without the layer (the scene is recorded on 4 threads, like the game).
+- what `object_motion=1` costs, in a busy-city scene of vehicles (1 in 20 moving) run with it off and on:
+  2400 vehicles in CI; on your PC `run_harness.ps1` uses 12000 (`-Vehicles`) and your GPU, and writes
+  `logs\harness\summary.md`.
 
 ```powershell
 cd scripts
