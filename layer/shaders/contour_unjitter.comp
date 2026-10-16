@@ -1,0 +1,41 @@
+#version 450
+// The terrain contour lines' depth with the jitter taken out (contour_fix=1), made in the same frame:
+// recorded right after the game's barrier that makes its colorMapDepthTex copy readable, so the
+// terrain draws that follow read this frame's depth. (The motion pass, camera_mv.comp binding 4, makes
+// the same image at the end of the frame when the game's copy isn't seen; that one is a frame late, so
+// the lines trail the camera while it moves.)
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D contourSrcTex;  // the game's copy (jittered)
+layout(set = 1, binding = 0, r32f) writeonly uniform image2D unjitteredDepthOut;
+layout(push_constant) uniform Push {
+    vec2 jitter;  // this frame's jitter in render pixels (the copy was rendered with it)
+    ivec2 size;   // render size
+} pc;
+
+// Same as UnjitteredDepth in camera_mv.comp: the viewport was shifted by +jitter pixels, so the
+// un-jittered pixel p shows what the jittered image has at p + jitter. Bilinear between the four nearest
+// texels; next to the sky (depth 1) the nearest texel, so the game's "depth == 1: no contours" test
+// still works and no edge blends with the far plane.
+float UnjitteredDepth(ivec2 p, ivec2 size, vec2 jitter) {
+    vec2 at = vec2(p) + jitter;
+    ivec2 i0 = ivec2(floor(at));
+    vec2 f = at - vec2(i0);
+    ivec2 hi = size - 1;
+    float d00 = texelFetch(contourSrcTex, clamp(i0, ivec2(0), hi), 0).r;
+    float d10 = texelFetch(contourSrcTex, clamp(i0 + ivec2(1, 0), ivec2(0), hi), 0).r;
+    float d01 = texelFetch(contourSrcTex, clamp(i0 + ivec2(0, 1), ivec2(0), hi), 0).r;
+    float d11 = texelFetch(contourSrcTex, clamp(i0 + ivec2(1, 1), ivec2(0), hi), 0).r;
+    if (max(max(d00, d10), max(d01, d11)) >= 1.0) {
+        ivec2 n = clamp(ivec2(floor(at + 0.5)), ivec2(0), hi);
+        return texelFetch(contourSrcTex, n, 0).r;
+    }
+    return mix(mix(d00, d10, f.x), mix(d01, d11, f.x), f.y);
+}
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= pc.size.x || p.y >= pc.size.y) return;
+    imageStore(unjitteredDepthOut, p, vec4(UnjitteredDepth(p, pc.size, pc.jitter)));
+}

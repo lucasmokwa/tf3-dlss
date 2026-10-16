@@ -1159,8 +1159,9 @@ int main(int argc, char** argv) {
             vkCmdSetViewport(cb, 0, 1, &vp);
             vkCmdSetScissor(cb, 0, 1, &sc);
         };
-        // the depth copy that next frame's contour lines read (colorMapDepthTex). As in TF3 it is taken
-        // mid-frame: before the last scene part, so it has the walls but not the cubes.
+        // the depth copy the contour lines read (colorMapDepthTex). As in TF3 it is taken mid-frame: before
+        // the last scene part, so it has the walls but not the cubes; that part's draws read it in the same
+        // frame (the layer un-jitters it right after this copy), the earlier parts next frame.
         auto copyContourDepth = [&](VkCommandBuffer cb) {
             const VkImageAspectFlags ds = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
             VkImageMemoryBarrier b[2] = {{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER}, {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER}};
@@ -1386,6 +1387,11 @@ int main(int argc, char** argv) {
         AddCheck("contour lines get un-jittered depth", contour,
                  contour ? "the log says the colorMapDepthTex draws were given the layer's un-jittered depth"
                          : "the log never says the colorMapDepthTex draws got the un-jittered depth");
+        bool sameFrame = log.find("right after its copy (same frame") != std::string::npos;
+        AddCheck("contour depth un-jittered in the same frame", sameFrame,
+                 sameFrame ? "the log says the game's colorMapDepthTex copy was un-jittered right after it was made"
+                           : "the log never says the contour depth was un-jittered right after the game's copy "
+                             "(it would be a frame late: the lines trail the camera)");
         if (log.find("contour_debug=1") != std::string::npos) {  // the run with contour_debug=1
             bool dbg = log.find("game copy vs our un-jittered depth") != std::string::npos &&
                        log.find("ours made from the game's copy") != std::string::npos &&
