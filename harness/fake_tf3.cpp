@@ -1327,6 +1327,13 @@ int main(int argc, char** argv) {
         AddCheck("contour lines get un-jittered depth", contour,
                  contour ? "the log says the colorMapDepthTex draws were given the layer's un-jittered depth"
                          : "the log never says the colorMapDepthTex draws got the un-jittered depth");
+        if (log.find("contour_debug=1") != std::string::npos) {  // the run with contour_debug=1
+            bool dbg = log.find("game copy vs our un-jittered depth") != std::string::npos &&
+                       fs::exists(g_opt.out / "contourcap", ec);
+            AddCheck("contour debug capture", dbg,
+                     dbg ? "contour_debug=1 saved the game's colorMapDepthTex and ours, and logged how far apart they are"
+                         : "contour_debug=1 didn't save or compare the game's colorMapDepthTex");
+        }
         std::vector<fs::path> caps;
         for (auto& e : fs::directory_iterator(g_opt.out / "mvcap", ec))
             if (e.path().extension() == ".json") caps.push_back(e.path());

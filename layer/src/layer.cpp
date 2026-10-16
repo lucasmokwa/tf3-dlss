@@ -295,6 +295,7 @@ struct Config {
     int skipGameFsr = 0;        // don't draw the game's FSR 1 passes while DLSS/FSR 3.1 replaces their result
     int gpuCrashInfo = 0;       // GPU checkpoints + fault report in the log if the GPU crashes (off by default; needs a restart)
     int contourFix = 1;         // give the terrain contour lines an un-jittered depth (see ContourSync)
+    int contourDebug = 0;       // 1 = save the game's contour depth next to ours (see ContourDebugCopies)
 } g_cfg;
 
 std::filesystem::path g_cfgPath;
@@ -385,18 +386,19 @@ bool LoadConfig() {
         else if (k == "skip_game_fsr") c.skipGameFsr = iv;
         else if (k == "gpu_crash_info") c.gpuCrashInfo = iv;
         else if (k == "contour_fix") c.contourFix = iv;
+        else if (k == "contour_debug") c.contourDebug = iv;
         else Log("[cfg] unknown setting '%s' ignored", k.c_str());
     }
     g_cfg = c;
     Log("[cfg] loaded %s: enabled=%d upscaler=%s preset=%d motion_vectors=%d object_motion=%d jitter=%d (phases %d, "
         "sign %g,%g, fsr sign %g,%g) sharpness=%g fsr_sharpness=%g mip_bias=%s%g fsr_color=%s fsr_debug=%d overlay=%d debug_keys=%d "
         "dlss_dev=%d mv_scale=(%g,%g) reset_distance=%g mv_double=%d debug_view=%d cfg_live=%d log_every=%d perf=%d "
-        "perf_seconds=%g skip_game_fsr=%d gpu_crash_info=%d contour_fix=%d",
+        "perf_seconds=%g skip_game_fsr=%d gpu_crash_info=%d contour_fix=%d contour_debug=%d",
         g_cfgPath.string().c_str(), c.enabled, PrefName(c.upscaler), c.preset, c.motionVectors, c.objectMotion,
         c.jitter, c.jitterPhases, c.jitterSignX, c.jitterSignY, c.fsrJitterSignX, c.fsrJitterSignY, c.sharpness, c.fsrSharpness,
         c.mipBiasAuto ? "auto " : "", c.mipBias, c.fsrColorSrgb ? "srgb" : "linear", c.fsrDebug, c.overlay,
         c.debugKeys, c.dlssDev, c.mvScaleX, c.mvScaleY, c.resetDistance, c.mvDouble, c.debugView, c.cfgLive, c.logEvery,
-        c.perf, c.perfSeconds, c.skipGameFsr, c.gpuCrashInfo, c.contourFix);
+        c.perf, c.perfSeconds, c.skipGameFsr, c.gpuCrashInfo, c.contourFix, c.contourDebug);
     return true;
 }
 
@@ -982,7 +984,9 @@ std::vector<VkImage> FbImages(VkFramebuffer fb) {
         for (VkImageView v : it->second) out.push_back(ViewImage(v));
     return out;
 }
+void NoteContourRewrite(VkDescriptorSet set);
 void StoreDesc(VkDescriptorSet set, uint32_t binding, uint32_t element, const DescItem& d) {
+    if (g_cfg.contourDebug) NoteContourRewrite(set);
     auto& v = g_setContents[set][binding];
     if (v.size() <= element) v.resize(element + 1);
     v[element] = d;
@@ -2013,6 +2017,9 @@ const char* ViewData(const CmdState& cs) {
     return mi->second.ptr + (at - mi->second.offset);
 }
 
+void ContourDebugNoteJitter(uint64_t frame, float jx, float jy);
+void ContourDebugCopies(DeviceData* d, VkCommandBuffer cb, CmdState& cs, uint32_t w, uint32_t h);
+
 // Called at submit, after the game has written this frame's camera data. Caller holds g_t.
 void UploadMvMatrices(const CmdState& cs) {
     MvUbo u{};
@@ -2044,6 +2051,7 @@ void UploadMvMatrices(const CmdState& cs) {
         u.jitterPx[0] = jx;
         u.jitterPx[1] = jy;
         u.jitterPx[2] = g_cfg.contourFix ? 1.f : 0.f;  // contour_fix=0 skips that work (comparable with perf=1)
+        ContourDebugNoteJitter(g_frame, jx, jy);
         bool jump = false;
         if (g_dlss.havePrev) {
             float dx = cam[0] - g_dlss.prevCam[0], dy = cam[1] - g_dlss.prevCam[1], dz = cam[2] - g_dlss.prevCam[2];
@@ -2256,9 +2264,11 @@ bool EnsureImages(DeviceData* d, uint32_t inW, uint32_t inH, uint32_t outW, uint
                             VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                                 VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,  // recordings
                             &g_dlss.mvImage, &g_dlss.mvView) ||
-            !CreateOwnImage(d, inW, inH, VK_FORMAT_R32_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-                            &g_dlss.depth32Image, &g_dlss.depth32View) ||
-            !CreateOwnImage(d, inW, inH, VK_FORMAT_R32_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+            !CreateOwnImage(d, inW, inH, VK_FORMAT_R32_SFLOAT,
+                            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                            &g_dlss.depth32Image, &g_dlss.depth32View) ||  // TRANSFER_SRC: contour_debug
+            !CreateOwnImage(d, inW, inH, VK_FORMAT_R32_SFLOAT,
+                            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
                             &g_dlss.contourImage, &g_dlss.contourView)) {
             Log("[upscale] failed to create the motion-vector / depth images; upscaling stops");
             g_dlss.mvImage = VK_NULL_HANDLE;
@@ -3921,6 +3931,7 @@ void RecordUpscale(DeviceData* d, VkCommandBuffer cb, CmdState& cs) {
         Barrier(d, cb, g_dlss.depth32Image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, RO);
         Barrier(d, cb, g_dlss.contourImage, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, RO);
         g_contourWritten = true;
+        ContourDebugCopies(d, cb, cs, ci.w, ci.h);
         VkBufferMemoryBarrier bb{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
         bb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
         bb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
@@ -4151,6 +4162,8 @@ struct ContourState {
     uint64_t swaps = 0;  // draws swapped since the last log
     bool loggedFirst = false;
     bool loggedSkip = false;
+    VkDescriptorSet lastGameSet = VK_NULL_HANDLE;  // the game's set we last replaced (contour_debug)
+    uint32_t lastBinding = 0;
 } g_contour;
 
 bool ContourOn() {  // caller holds g_t
@@ -4306,6 +4319,8 @@ void ContourSync(DeviceData* d, VkCommandBuffer cb, CmdState& cs) {
     cs.contourBound = true;
     cs.contourIdx = si;
     cs.contourOurs = ours;
+    g_contour.lastGameSet = bs.set;
+    g_contour.lastBinding = cs.pipe->contourBinding;
     ++g_contour.swaps;
     if (!g_contour.loggedFirst) {
         g_contour.loggedFirst = true;
@@ -4313,6 +4328,203 @@ void ContourSync(DeviceData* d, VkCommandBuffer cb, CmdState& cs) {
             "un-jittered depth", (unsigned long long)g_hot.frame.load(), H(cs.pipeline).c_str(), si,
             cs.pipe->contourBinding);
     }
+}
+
+// ---- contour_debug=1 (or Ctrl+Shift+C with debug_keys=1): what the contour lines are drawn from ------
+// Copies, for a few frames in a row right after the motion pass, the game's colorMapDepthTex (as it is at
+// that moment), our un-jittered depth and this frame's jittered depth to disk (contourcap\ next to the
+// log, raw float32 at render size) and logs how far apart they are. Also counts how often the game
+// rewrites a set we already copied that frame (our copy would then hold its old descriptors).
+// Off by default; the game's depth copy can only be read back if debug_keys=1 when the game starts.
+struct ContourDebug {
+    int requested = 0;     // frames still to capture
+    VkBuffer buf[3] = {};  // the game's copy, our un-jittered depth, this frame's jittered depth
+    char* ptr[3] = {};
+    uint32_t w = 0, h = 0;
+    bool failed = false;
+    struct Frame {
+        uint64_t frame = 0;
+        float jx = 0, jy = 0;
+        bool gameCopied = false;
+        VkFormat gameFmt = VK_FORMAT_UNDEFINED;
+        std::string gameDesc;  // the game's image, or why it couldn't be copied
+        int gameLayout = -1;
+    };
+    std::vector<Frame> pending;  // copied, written after the GPU finished (at submit)
+    int counter = 0;
+    std::vector<float> prevDepth;  // the last captured frame's jittered depth
+    uint64_t prevFrame = 0;
+    uint64_t rewrites = 0;  // game set rewrites after we copied it, since the last report
+} g_cdbg;  // guarded by g_t
+
+void ContourDebugNoteJitter(uint64_t frame, float jx, float jy) {  // caller holds g_t
+    for (auto& f : g_cdbg.pending)
+        if (f.frame == frame) {
+            f.jx = jx;
+            f.jy = jy;
+        }
+}
+
+void NoteContourRewrite(VkDescriptorSet set) {  // caller holds g_t
+    std::lock_guard<std::mutex> cl(g_contourLock);
+    if (g_contour.setsFrame == g_hot.frame.load(std::memory_order_relaxed) && g_contour.sets.count(set))
+        ++g_cdbg.rewrites;
+}
+
+// Called in RecordUpscale right after the motion pass wrote our un-jittered depth. Caller holds g_t.
+void ContourDebugCopies(DeviceData* d, VkCommandBuffer cb, CmdState& cs, uint32_t w, uint32_t h) {
+    if (g_cdbg.requested <= 0 || g_cdbg.failed || !g_cfg.contourFix) return;
+    --g_cdbg.requested;
+    if (g_cdbg.w != w || g_cdbg.h != h || !g_cdbg.buf[0]) {
+        for (int i = 0; i < 3; ++i)
+            if (!CreateBuffer(d, (VkDeviceSize)w * h * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                              VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &g_cdbg.buf[i],
+                              &g_cdbg.ptr[i])) {
+                Log("[contour-debug] could not create readback buffers");
+                g_cdbg.failed = true;
+                return;
+            }
+        g_cdbg.w = w;
+        g_cdbg.h = h;
+    }
+    const VkImageLayout RO = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, SRC = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    ContourDebug::Frame f;
+    f.frame = g_frame;  // jitter: filled in when the motion pass's camera data is written (at submit)
+    VkBufferImageCopy ic{};
+    ic.imageExtent = {w, h, 1};
+    ic.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    for (int i = 1; i < 3; ++i) {
+        VkImage img = i == 1 ? g_dlss.contourImage : g_dlss.depth32Image;
+        Barrier(d, cb, img, VK_IMAGE_ASPECT_COLOR_BIT, RO, SRC);
+        d->CmdCopyImageToBuffer(cb, img, SRC, g_cdbg.buf[i], 1, &ic);
+        Barrier(d, cb, img, VK_IMAGE_ASPECT_COLOR_BIT, SRC, RO);
+    }
+    // the game's colorMapDepthTex: the image behind that binding of the set we last replaced
+    VkDescriptorSet gameSet;
+    uint32_t binding;
+    {
+        std::lock_guard<std::mutex> cl(g_contourLock);
+        gameSet = g_contour.lastGameSet;
+        binding = g_contour.lastBinding;
+    }
+    VkImage gimg = VK_NULL_HANDLE;
+    auto sc = g_setContents.find(gameSet);
+    if (sc != g_setContents.end()) {
+        auto b = sc->second.find(binding);
+        if (b != sc->second.end() && !b->second.empty()) gimg = ViewImage(b->second[0].view);
+    }
+    auto gi = g_images.find(gimg);
+    if (!gimg || gi == g_images.end()) {
+        f.gameDesc = "not found (no terrain draw seen yet, or its set wasn't tracked)";
+    } else {
+        f.gameDesc = ImageDesc(gimg);
+        f.gameFmt = gi->second.fmt;
+        VkImageLayout gl = CurrentLayout(cs, gimg);
+        f.gameLayout = (int)gl;
+        if (!(gi->second.usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT))
+            f.gameDesc += " (can't be read back: set debug_keys=1 and restart the game)";
+        else if (gi->second.w != w || gi->second.h != h)
+            f.gameDesc += " (not the render size: not copied)";
+        else if (gl == VK_IMAGE_LAYOUT_UNDEFINED || gl == VK_IMAGE_LAYOUT_MAX_ENUM)
+            f.gameDesc += " (layout unknown: not copied)";
+        else if (f.gameFmt != VK_FORMAT_D24_UNORM_S8_UINT && f.gameFmt != VK_FORMAT_X8_D24_UNORM_PACK32 &&
+                 f.gameFmt != VK_FORMAT_D32_SFLOAT && f.gameFmt != VK_FORMAT_D32_SFLOAT_S8_UINT &&
+                 f.gameFmt != VK_FORMAT_D16_UNORM)
+            f.gameDesc += " (depth format not handled: not copied)";
+        else {
+            VkImageAspectFlags asp = VK_IMAGE_ASPECT_DEPTH_BIT | (HasStencil(f.gameFmt) ? VK_IMAGE_ASPECT_STENCIL_BIT : 0);
+            Barrier(d, cb, gimg, asp, gl, SRC);
+            ic.imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
+            d->CmdCopyImageToBuffer(cb, gimg, SRC, g_cdbg.buf[0], 1, &ic);
+            Barrier(d, cb, gimg, asp, SRC, gl);
+            f.gameCopied = true;
+        }
+    }
+    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, nullptr, 0,
+                          nullptr);
+    g_cdbg.pending.push_back(f);
+}
+
+// How far apart two depth images are, over pixels where both are geometry (not sky).
+std::string DepthDiff(const float* a, const float* b, size_t n) {
+    size_t both = 0, differ = 0, skyMismatch = 0;
+    double sum = 0, maxd = 0;
+    for (size_t i = 0; i < n; ++i) {
+        bool sa = a[i] >= 1.f, sb = b[i] >= 1.f;
+        if (sa != sb) ++skyMismatch;
+        if (sa || sb) continue;
+        ++both;
+        double dd = std::fabs((double)a[i] - b[i]);
+        sum += dd;
+        maxd = std::max(maxd, dd);
+        if (dd > 1e-6) ++differ;  // D24 steps are 6e-8
+    }
+    char t[200];
+    std::snprintf(t, sizeof t, "mean %.3g, max %.3g, %.2f%% of pixels differ, %.2f%% sky in one only",
+                  both ? sum / both : 0.0, maxd, both ? 100.0 * differ / both : 0.0, n ? 100.0 * skyMismatch / n : 0.0);
+    return t;
+}
+
+// Caller holds g_t; the GPU has finished the frame's copies.
+void ContourDebugWrite(const ContourDebug::Frame& f) {
+    const size_t n = (size_t)g_cdbg.w * g_cdbg.h;
+    const float* ours = reinterpret_cast<const float*>(g_cdbg.ptr[1]);
+    const float* depth = reinterpret_cast<const float*>(g_cdbg.ptr[2]);
+    std::vector<float> game;
+    if (f.gameCopied) {
+        game.resize(n);
+        if (f.gameFmt == VK_FORMAT_D16_UNORM) {
+            const uint16_t* s = reinterpret_cast<const uint16_t*>(g_cdbg.ptr[0]);
+            for (size_t i = 0; i < n; ++i) game[i] = s[i] / 65535.f;
+        } else if (f.gameFmt == VK_FORMAT_D32_SFLOAT || f.gameFmt == VK_FORMAT_D32_SFLOAT_S8_UINT) {
+            std::memcpy(game.data(), g_cdbg.ptr[0], n * 4);
+        } else {  // D24: the low 24 bits
+            const uint32_t* s = reinterpret_cast<const uint32_t*>(g_cdbg.ptr[0]);
+            for (size_t i = 0; i < n; ++i) game[i] = (s[i] & 0xFFFFFFu) / 16777215.f;
+        }
+    }
+    std::error_code ec;
+    std::filesystem::path dir = CaptureDir().parent_path() / "contourcap";
+    std::filesystem::create_directories(dir, ec);
+    char base[96];
+    std::snprintf(base, sizeof base, "contour%03d_f%llu", g_cdbg.counter++, (unsigned long long)f.frame);
+    auto dump = [&](const float* v, const char* ext) {
+        std::ofstream o(dir / (std::string(base) + ext), std::ios::binary);
+        o.write(reinterpret_cast<const char*>(v), (std::streamsize)(n * 4));
+    };
+    dump(ours, ".ours.f32");
+    dump(depth, ".depth.f32");
+    if (f.gameCopied) dump(game.data(), ".game.f32");
+    bool prev = g_cdbg.prevFrame + 1 == f.frame && g_cdbg.prevDepth.size() == n;
+    {
+        std::ofstream j(dir / (std::string(base) + ".json"));
+        j << "{\n  \"frame\": " << f.frame << ",\n  \"w\": " << g_cdbg.w << ",\n  \"h\": " << g_cdbg.h
+          << ",\n  \"jitter_px\": [" << f.jx << ", " << f.jy << "],\n  \"game_copied\": " << (f.gameCopied ? "true" : "false")
+          << ",\n  \"game_layout\": " << f.gameLayout << ",\n  \"files\": \"float32, row-major, top row first\"\n}\n";
+    }
+    Log("[contour-debug] frame %llu: wrote %s; jitter (%.3f, %.3f) px; game's colorMapDepthTex: %s, layout %d",
+        (unsigned long long)f.frame, base, f.jx, f.jy, f.gameDesc.c_str(), f.gameLayout);
+    if (f.gameCopied) {
+        Log("[contour-debug]   game copy vs this frame's jittered depth: %s", DepthDiff(game.data(), depth, n).c_str());
+        if (prev)
+            Log("[contour-debug]   game copy vs last frame's jittered depth: %s",
+                DepthDiff(game.data(), g_cdbg.prevDepth.data(), n).c_str());
+        Log("[contour-debug]   game copy vs our un-jittered depth: %s", DepthDiff(game.data(), ours, n).c_str());
+    }
+    Log("[contour-debug]   our un-jittered depth vs this frame's jittered depth: %s", DepthDiff(ours, depth, n).c_str());
+    g_cdbg.prevDepth.assign(depth, depth + n);
+    g_cdbg.prevFrame = f.frame;
+}
+void ContourDebugStart(const char* why) {  // caller holds g_t
+    if (!g_cfg.contourFix || !g_contourWritten) {
+        Log("[contour-debug] %s: nothing to capture (contour_fix=0, or no upscaled frame with jitter yet)", why);
+        return;
+    }
+    g_cdbg.requested = 3;
+    Log("[contour-debug] %s: capturing the next 3 frames", why);
 }
 
 // =============================================================================================
@@ -5471,8 +5683,10 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_CreateImage(VkDevice device, const VkI
     }
     // Recordings (Ctrl+Shift+T, TF3_DLSS_CAPTURE) copy the depth and the upscaler's input colour out, which
     // needs TRANSFER_SRC. Only added when recordings are possible: players' images stay as the game made them.
+    // contour_debug copies the game's depth copy for the contour lines (sampled, not an attachment) too.
     if (RecordingPossible() && info.imageType == VK_IMAGE_TYPE_2D && info.extent.width >= 1000 &&
-        (info.usage & (VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) &&
+        ((info.usage & (VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) ||
+         IsDepthFormat(info.format)) &&
         (info.usage & VK_IMAGE_USAGE_SAMPLED_BIT))
         info.usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
     DeviceData* d = GetDevice(Key(device));
@@ -6218,6 +6432,10 @@ void UpdateHot() {
             Log("[contour] frame %llu: the un-jittered depth was bound for terrain draws %llu times since the last "
                 "report", (unsigned long long)g_frame, (unsigned long long)g_contour.swaps);
         g_contour.swaps = 0;
+        if (g_cfg.contourDebug)
+            Log("[contour-debug] frame %llu: the game rewrote a set after we copied it this frame %llu times since the "
+                "last report", (unsigned long long)g_frame, (unsigned long long)g_cdbg.rewrites);
+        g_cdbg.rewrites = 0;
     }
     g_hot.inW.store(g_dlss.inW, std::memory_order_relaxed);
     g_hot.inH.store(g_dlss.inH, std::memory_order_relaxed);
@@ -6338,10 +6556,16 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_QueueSubmit(VkQueue queue, uint32_t su
         TLock lk(g_t);
         toWrite.swap(g_cap.pending);
     }
-    if (!toWrite.empty() && r == VK_SUCCESS) {
+    std::vector<ContourDebug::Frame> contourWrite;
+    {
+        TLock lk(g_t);
+        contourWrite.swap(g_cdbg.pending);
+    }
+    if ((!toWrite.empty() || !contourWrite.empty()) && r == VK_SUCCESS) {
         d->QueueWaitIdle(queue);  // recording frames only: wait so the copies are complete
         TLock lk(g_t);
         for (const auto& f : toWrite) WriteCapture(f);
+        for (const auto& f : contourWrite) ContourDebugWrite(f);
     }
     return r;
 }
@@ -6350,6 +6574,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_QueuePresentKHR(VkQueue queue, const V
     {
         PerfScope ps(kPerfPresent);
         TLock lk(g_t);
+        {   // contour_debug: capture when it is switched on (at start or in the cfg while playing)
+            static int contourDebugWas = 0;
+            if (g_cfg.contourDebug && !contourDebugWas) ContourDebugStart("contour_debug=1");
+            contourDebugWas = g_cfg.contourDebug;
+        }
 #ifdef _WIN32
         // Hotkeys, only while the game window has focus and only with debug_keys=1 in tf3_dlss.cfg (players
         // choose with the cfg, so a stray key press can't switch the upscaler off):
@@ -6361,6 +6590,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_QueuePresentKHR(VkQueue queue, const V
         //   Ctrl+Shift+Y  automated small-tilt wobble test, records 8 frames in a row
         //   Ctrl+Shift+L  log every draw of one frame (pass, jitter, pipeline state, shader names)
         //   Ctrl+Shift+J  jitter on/off
+        //   Ctrl+Shift+C  save what the terrain contour lines are drawn from (see contour_debug)
         //   Ctrl+Shift+O  on-screen info box on/off
         //   Ctrl+Shift+Up/Down  sharpness of the running upscaler +/- 0.1 (sharpness / fsr_sharpness)
         //   Ctrl+Shift+K  jitter sign of the running upscaler: X+Y+ -> X-Y+ -> X+Y- -> X-Y-
@@ -6391,6 +6621,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_QueuePresentKHR(VkQueue queue, const V
                 Log("[upscale] Ctrl+Shift+U: %s isn't available (%s)", BackendName(want),
                     want == Backend::Dlss ? g_dlss.why.c_str() : g_fsr.why.c_str());
         }
+        static bool cWasDown = false;
+        if (devPressed('C', cWasDown)) ContourDebugStart("Ctrl+Shift+C");
         if (devPressed('J', jWasDown)) {
             g_cfg.jitter = g_cfg.jitter ? 0 : 1;
             g_dlss.resetNext = true;

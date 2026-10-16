@@ -7,7 +7,7 @@
 # BUILD_DIR comes from:  cmake -S harness -B build/harness -G Ninja && cmake --build build/harness
 # Runs, each in its own folder under OUT_DIR:
 #   checks     all checks (motion vectors, blit swap, UI, ...) with the validation layer
-#   skip_fsr   the same with skip_game_fsr=1
+#   skip_fsr   the same with skip_game_fsr=1 and contour_debug=1
 #   perf       without validation, perf=1: the layer's [perf] report
 #   no_layer   fake_tf3 alone, to compare its CPU time per frame with "perf"
 # OUT_DIR/summary.md: the checks and the layer's cost in Markdown (CI shows it on the run's page).
@@ -52,7 +52,7 @@ vopt=""
 [ -n "$validation" ] && vopt="--validation"
 with_val="VK_LAYER_TF3_dlss${validation:+:$validation}"
 run checks "log_every=100" "$with_val" $vopt
-run skip_fsr "skip_game_fsr=1" "$with_val" $vopt
+run skip_fsr "skip_game_fsr=1\ncontour_debug=1" "$with_val" $vopt
 run perf "perf=1\nperf_seconds=5" "VK_LAYER_TF3_dlss"
 run no_layer "" "" --no-checks
 echo
