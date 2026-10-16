@@ -19,6 +19,9 @@
 // Moving objects are added afterwards by the object pass (object_mv.vert/.frag).
 // Also copies depth into an R32F image (binding 3): FSR 3.1 reads that instead of the game's
 // depth/stencil buffer, whose format its runtime can't always view directly.
+// And writes the depth with the jitter taken out (binding 4): the game draws its terrain contour lines
+// by rebuilding heights from last frame's depth with its un-jittered camera, so a jittered depth makes
+// the lines jump every frame. The layer hands the contour shader this image instead (see ContourSync).
 
 layout(local_size_x = 8, local_size_y = 8) in;
 
@@ -31,9 +34,34 @@ layout(set = 0, binding = 2, std140) uniform Matrices {
     mat4 prevViewProj;     // last frame: projView
     vec4 sizeAndScale;     // xy = render size in pixels, z = 1 to enable, 0 to write zeros,
                            // w = 1: curInvViewProj is the reprojection (current clip -> previous clip)
-    vec4 jitterPx;         // xy = this frame's jitter in pixels (depth was rendered with it)
+    vec4 jitterPx;         // xy = this frame's jitter in pixels (depth was rendered with it),
+                           // z = 1: write the un-jittered depth (contour_fix)
 } u;
 layout(set = 0, binding = 3, r32f) writeonly uniform image2D depthOut;
+layout(set = 0, binding = 4, r32f) writeonly uniform image2D unjitteredDepthOut;
+// What unjitteredDepthOut is made from: the game's own depth copy for the contour lines
+// (colorMapDepthTex, copied mid-frame before much of the scene is drawn over the ground), else depthTex.
+layout(set = 1, binding = 0) uniform sampler2D contourSrcTex;
+
+// Depth at pixel p as if rendered without jitter: the viewport was shifted by +jitter pixels, so the
+// un-jittered pixel centre p + 0.5 shows what the jittered image has at p + 0.5 + jitter. Bilinear
+// between the four nearest texels; next to the sky (depth 1) the nearest texel, so the game's
+// "depth == 1: no contours" test still works and no edge blends with the far plane.
+float UnjitteredDepth(ivec2 p, ivec2 size, vec2 jitter) {
+    vec2 at = vec2(p) + jitter;  // in texel units, texel centres at integers
+    ivec2 i0 = ivec2(floor(at));
+    vec2 f = at - vec2(i0);
+    ivec2 hi = size - 1;
+    float d00 = texelFetch(contourSrcTex, clamp(i0, ivec2(0), hi), 0).r;
+    float d10 = texelFetch(contourSrcTex, clamp(i0 + ivec2(1, 0), ivec2(0), hi), 0).r;
+    float d01 = texelFetch(contourSrcTex, clamp(i0 + ivec2(0, 1), ivec2(0), hi), 0).r;
+    float d11 = texelFetch(contourSrcTex, clamp(i0 + ivec2(1, 1), ivec2(0), hi), 0).r;
+    if (max(max(d00, d10), max(d01, d11)) >= 1.0) {
+        ivec2 n = clamp(ivec2(floor(at + 0.5)), ivec2(0), hi);
+        return texelFetch(contourSrcTex, n, 0).r;
+    }
+    return mix(mix(d00, d10, f.x), mix(d01, d11, f.x), f.y);
+}
 
 void main() {
     ivec2 p = ivec2(gl_GlobalInvocationID.xy);
@@ -41,10 +69,13 @@ void main() {
     if (p.x >= size.x || p.y >= size.y) return;
     float d = texelFetch(depthTex, p, 0).r;
     imageStore(depthOut, p, vec4(d));
-    if (u.sizeAndScale.z == 0.0) {
+    if (u.sizeAndScale.z == 0.0) {  // no camera data this frame: jitter unknown too
+        imageStore(unjitteredDepthOut, p, vec4(texelFetch(contourSrcTex, p, 0).r));
         mvOut[p.y * size.x + p.x] = 0u;
         return;
     }
+
+    if (u.jitterPx.z != 0.0) imageStore(unjitteredDepthOut, p, vec4(UnjitteredDepth(p, size, u.jitterPx.xy)));
 
     vec2 pix = vec2(p) + 0.5;
     vec4 ndc = vec4(pix.x / float(size.x) * 2.0 - 1.0, 1.0 - pix.y / float(size.y) * 2.0, d * 2.0 - 1.0, 1.0);

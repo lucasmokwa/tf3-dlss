@@ -7,7 +7,7 @@
 # BUILD_DIR comes from:  cmake -S harness -B build/harness -G Ninja && cmake --build build/harness
 # Runs, each in its own folder under OUT_DIR:
 #   checks     all checks (motion vectors, blit swap, UI, ...) with the validation layer
-#   skip_fsr   the same with skip_game_fsr=1
+#   skip_fsr   the same with skip_game_fsr=1 and contour_debug=1
 #   perf       without validation, perf=1: the layer's [perf] report
 #   no_layer   fake_tf3 alone, to compare its CPU time per frame with "perf"
 #   city_off   perf=1 with 2400 vehicles (1 in 20 moving), object_motion=0 (the default)
@@ -56,7 +56,7 @@ vopt=""
 with_val="VK_LAYER_TF3_dlss${validation:+:$validation}"
 # object_motion=1 in checks, skip_fsr and perf: the default, set here so the checks cover the object pass whatever the default
 run checks "log_every=100\nobject_motion=1" "$with_val" $vopt
-run skip_fsr "skip_game_fsr=1\nobject_motion=1" "$with_val" $vopt
+run skip_fsr "skip_game_fsr=1\nobject_motion=1\ncontour_debug=1" "$with_val" $vopt
 run perf "perf=1\nperf_seconds=5\nobject_motion=1" "VK_LAYER_TF3_dlss"
 run no_layer "" "" --no-checks
 CAP= run city_off "perf=1\nperf_seconds=5\nobject_motion=0" "VK_LAYER_TF3_dlss" --vehicles 2400 --no-checks
