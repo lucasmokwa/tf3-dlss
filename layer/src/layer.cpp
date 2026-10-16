@@ -687,6 +687,9 @@ struct CmdState {
     bool contourBound = false;
     uint32_t contourIdx = 0;
     VkDescriptorSet contourOurs = VK_NULL_HANDLE;
+    bool contourInFrame = false;  // the un-jittered depth was made earlier this frame: the motion pass skips it
+    bool inPass = false;          // inside a render pass
+    bool gameCompute = false;     // the game bound a compute pipeline here: ours would replace it
     bool jitterSet = false;  // jitter chosen for this frame (when DLSS was recorded)
     bool capture = false;    // this frame's MV/depth/colour are being copied out for analysis
     std::string capPhase;
@@ -929,6 +932,8 @@ struct HotState {
 } g_hot;
 // The un-jittered depth (g_dlss.contourImage) was written since it was created; else it's undefined.
 std::atomic<bool> g_contourWritten{false};
+// The frame whose un-jittered depth was made in-frame (ContourAfterGameBarrier). Guarded by g_t.
+uint64_t g_contourInFrame = UINT64_MAX;
 // Meshes that moved recently (g_movingMeshes), rebuilt at present; a render pass takes a reference.
 std::shared_ptr<const std::unordered_set<uint64_t>> g_movingSnap;
 VkExtent2D g_swapExtent = {0, 0};
@@ -1176,6 +1181,12 @@ struct Dlss {
     VkDescriptorSetLayout contourSrcLayout = VK_NULL_HANDLE;
     VkDescriptorPool contourSrcPool = VK_NULL_HANDLE;
     std::vector<std::pair<VkImageView, VkDescriptorSet>> contourSrcSets;
+    // the same-frame un-jitter (contour_unjitter.comp): set 0 = contourSrcLayout, set 1 = contourImage
+    VkDescriptorSetLayout contourOutLayout = VK_NULL_HANDLE;
+    VkPipelineLayout contourPipeLayout = VK_NULL_HANDLE;
+    VkPipeline contourPipeline = VK_NULL_HANDLE;
+    VkDescriptorPool contourOutPool = VK_NULL_HANDLE;
+    VkDescriptorSet contourOutSet = VK_NULL_HANDLE;
     // camera history
     bool havePrev = false;
     float prevPV[16] = {};
@@ -1674,6 +1685,70 @@ void InvalidateViewCaches(DeviceData* d) {
     g_dlss.tstSetUsed = false;
 }
 
+const uint32_t kContourSpirv[] = {
+#include "contour_unjitter.spv.inc"
+};
+struct ContourPush {  // must match the push-constant block in contour_unjitter.comp
+    float jitter[2];
+    int32_t size[2];
+};
+
+// contour_unjitter.comp's pipeline and its output set (pointed at contourImage by WriteContourOutSet).
+// Needs contourSrcLayout. Caller holds g_t.
+bool CreateContourPipeline(DeviceData* d) {
+    VkDescriptorSetLayoutBinding b = {0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    li.bindingCount = 1;
+    li.pBindings = &b;
+    if (d->CreateDescriptorSetLayout(d->device, &li, nullptr, &g_dlss.contourOutLayout) != VK_SUCCESS) return false;
+    VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1};
+    VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    pi.maxSets = 1;
+    pi.poolSizeCount = 1;
+    pi.pPoolSizes = &ps;
+    if (d->CreateDescriptorPool(d->device, &pi, nullptr, &g_dlss.contourOutPool) != VK_SUCCESS) return false;
+    VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    ai.descriptorPool = g_dlss.contourOutPool;
+    ai.descriptorSetCount = 1;
+    ai.pSetLayouts = &g_dlss.contourOutLayout;
+    if (d->AllocateDescriptorSets(d->device, &ai, &g_dlss.contourOutSet) != VK_SUCCESS) return false;
+    VkDescriptorSetLayout setLayouts[2] = {g_dlss.contourSrcLayout, g_dlss.contourOutLayout};
+    VkPushConstantRange pr = {VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(ContourPush)};
+    VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    pli.setLayoutCount = 2;
+    pli.pSetLayouts = setLayouts;
+    pli.pushConstantRangeCount = 1;
+    pli.pPushConstantRanges = &pr;
+    if (d->CreatePipelineLayout(d->device, &pli, nullptr, &g_dlss.contourPipeLayout) != VK_SUCCESS) return false;
+    VkShaderModuleCreateInfo si{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    si.codeSize = sizeof kContourSpirv;
+    si.pCode = kContourSpirv;
+    VkShaderModule mod;
+    if (d->CreateShaderModule(d->device, &si, nullptr, &mod) != VK_SUCCESS) return false;
+    VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    ci.stage.module = mod;
+    ci.stage.pName = "main";
+    ci.layout = g_dlss.contourPipeLayout;
+    VkResult r = d->CreateComputePipelines(d->device, VK_NULL_HANDLE, 1, &ci, nullptr, &g_dlss.contourPipeline);
+    d->DestroyShaderModule(d->device, mod, nullptr);
+    return r == VK_SUCCESS;
+}
+
+// Point contourOutSet at contourImage (made again when the render size changes). Called right after
+// CreateMvResources, whose InvalidateViewCaches waited for the GPU. Caller holds g_t.
+void WriteContourOutSet(DeviceData* d) {
+    if (!g_dlss.contourOutSet || !g_dlss.contourView) return;
+    VkDescriptorImageInfo ci{VK_NULL_HANDLE, g_dlss.contourView, VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    w.dstSet = g_dlss.contourOutSet;
+    w.descriptorCount = 1;
+    w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    w.pImageInfo = &ci;
+    d->UpdateDescriptorSets(d->device, 1, &w, 0, nullptr);
+}
+
 // Pipeline objects (once) and the per-size buffer. Caller holds g_t.
 bool CreateMvResources(DeviceData* d, uint32_t w, uint32_t h) {
     if (!g_dlss.mvPipeline) {
@@ -1717,6 +1792,11 @@ bool CreateMvResources(DeviceData* d, uint32_t w, uint32_t h) {
         VkResult r = d->CreateComputePipelines(d->device, VK_NULL_HANDLE, 1, &ci, nullptr, &g_dlss.mvPipeline);
         d->DestroyShaderModule(d->device, mod, nullptr);
         if (r != VK_SUCCESS) return false;
+        if (!CreateContourPipeline(d)) {  // optional: without it the motion pass makes the depth, a frame late
+            Log("[contour] could not create the same-frame un-jitter pass; the contour depth is made at the end of "
+                "the frame");
+            g_dlss.contourPipeline = VK_NULL_HANDLE;
+        }
         VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 8},
                                         {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8},
                                         {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 8},
@@ -2105,6 +2185,8 @@ void UploadMvMatrices(const CmdState& cs) {
     MvUbo u{};
     u.sizeAndScale[0] = (float)g_dlss.inW;
     u.sizeAndScale[1] = (float)g_dlss.inH;
+    // contour_fix=0 skips that work (comparable with perf=1); so does a frame that made it already
+    u.jitterPx[2] = g_cfg.contourFix && !cs.contourInFrame ? 1.f : 0.f;
     const char* v = ViewData(cs);
     if (!v) {
         if (g_dlss.mvNoViewWarned++ < 3) Log("[mv] camera data not available this frame; motion vectors set to zero");
@@ -2130,7 +2212,6 @@ void UploadMvMatrices(const CmdState& cs) {
             JitterInverse(u.curInvViewProj, 2.f * jx / (float)vw, -2.f * jy / (float)vh);
         u.jitterPx[0] = jx;
         u.jitterPx[1] = jy;
-        u.jitterPx[2] = g_cfg.contourFix ? 1.f : 0.f;  // contour_fix=0 skips that work (comparable with perf=1)
         ContourDebugNoteJitter(g_frame, jx, jy);
         bool jump = false;
         if (g_dlss.havePrev) {
@@ -2363,6 +2444,8 @@ bool EnsureImages(DeviceData* d, uint32_t inW, uint32_t inH, uint32_t outW, uint
         if (!CreateMvResources(d, inW, inH)) {
             Log("[mv] failed to create the motion-vector pass; the upscaler will run with zero motion");
             g_dlss.mvReady = false;
+        } else {
+            WriteContourOutSet(d);
         }
     }
     return true;
@@ -4012,8 +4095,11 @@ void RecordUpscale(DeviceData* d, VkCommandBuffer cb, CmdState& cs) {
         }
         // the depth copy (old contents not needed) -> writable
         Barrier(d, cb, g_dlss.depth32Image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
-        // the un-jittered copy: last frame's terrain draws are done with it (Barrier waits for everything)
-        Barrier(d, cb, g_dlss.contourImage, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+        // the un-jittered copy: last frame's terrain draws are done with it (Barrier waits for everything).
+        // If it was made earlier this frame (ContourAfterGameBarrier) the pass leaves it as it is.
+        cs.contourInFrame = g_contourInFrame == g_frame;
+        Barrier(d, cb, g_dlss.contourImage, VK_IMAGE_ASPECT_COLOR_BIT,
+                cs.contourInFrame ? RO : VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
         VkImageView contourSrc = ContourSourceView(cs, ci.w, ci.h);
         VkDescriptorSet srcSet = ContourSrcSet(d, contourSrc ? contourSrc : depthView);
         if (!srcSet) srcSet = ContourSrcSet(d, depthView);
@@ -4234,13 +4320,16 @@ VkDescriptorSet BlitSet(DeviceData* d, VkDescriptorSet gameSet, uint32_t binding
 // ---------------------------------------------------------------------------------------------
 // The terrain tool's contour lines are drawn by the terrain shader itself (getColor in
 // shaders/util/color_map.fs). With useDepthTextureForContours it rebuilds each pixel's height from
-// a depth image (colorMapDepthTex: a copy of last frame's scene depth) with the game's camera,
-// which is never jittered (jitter goes through the viewport). With jitter on, that depth was drawn
-// shifted by last frame's jitter, so the rebuilt height is off by the jitter times how fast height
-// changes across the screen - many pixels of line movement on gentle slopes - and the lines jump
-// every frame. For those draws only, the layer binds a copy of the set with colorMapDepthTex
-// pointing at its own un-jittered depth (camera_mv.comp, binding 4), made from last frame's depth
-// too. Everything else that reads the game's depth copy is unchanged.
+// a depth image (colorMapDepthTex: a copy of the scene depth the game makes mid-frame) with the
+// game's camera, which is never jittered (jitter goes through the viewport). With jitter on, that
+// depth was drawn shifted by the jitter, so the rebuilt height is off by the jitter times how fast
+// height changes across the screen - many pixels of line movement on gentle slopes - and the lines
+// jump every frame. For those draws only, the layer binds a copy of the set with colorMapDepthTex
+// pointing at its own un-jittered depth (contourImage). That is made from the game's copy right after
+// the game makes it, in the same frame (ContourAfterGameBarrier, contour_unjitter.comp); until the
+// game's copy is known, by the motion pass at the end of the frame (camera_mv.comp, binding 4), which
+// is a frame late and makes the lines trail the camera while it moves. Everything else that reads
+// the game's depth copy is unchanged.
 // Guards g_contour and our pools. Not g_t: the swaps happen while the game records on several threads.
 std::mutex g_contourLock;
 struct ContourState {
@@ -4452,6 +4541,64 @@ VkImageView ContourSourceView(const CmdState& cs, uint32_t w, uint32_t h) {
     if (ii.w != w || ii.h != h || !IsDepthFormat(ii.fmt)) return VK_NULL_HANDLE;
     if (CurrentLayout(cs, img) != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) return VK_NULL_HANDLE;
     return view;
+}
+
+// The game copies its scene depth into colorMapDepthTex mid-frame and its terrain draws after that read
+// it in the same frame. Un-jittering it at the end of the frame (the motion pass) is a frame late: the
+// next frame's draws rebuild heights from last frame's view with this frame's camera, so the lines
+// slide with the camera while it moves. So right after the game's barrier that makes its fresh copy
+// readable, un-jitter it into contourImage here, with this frame's jitter. Called for each image
+// barrier list the game records outside a render pass. Caller holds g_t.
+void ContourAfterGameBarrier(DeviceData* d, VkCommandBuffer cb, CmdState& cs, uint32_t imgCount,
+                             const VkImageMemoryBarrier* img) {
+    const VkImageLayout RO = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    if (!g_cfg.contourFix || !g_dlss.contourPipeline || !g_dlss.mvReady || cs.inPass || !ViewportJitterOn()) return;
+    bool any = false;  // cheap test first: most barriers make nothing readable after a write
+    for (uint32_t i = 0; i < imgCount && !any; ++i)
+        any = img[i].newLayout == RO && img[i].oldLayout != RO && img[i].oldLayout != VK_IMAGE_LAYOUT_UNDEFINED;
+    if (!any) return;
+    VkImageView view = VK_NULL_HANDLE;
+    VkImage src = ContourSourceImage(&view);  // known once a terrain draw was seen
+    if (!src) return;
+    uint32_t i = 0;
+    for (; i < imgCount; ++i)
+        if (img[i].image == src && img[i].newLayout == RO && img[i].oldLayout != RO &&
+            img[i].oldLayout != VK_IMAGE_LAYOUT_UNDEFINED)
+            break;
+    if (i == imgCount) return;
+    const ImageInfo& ii = g_images[src];
+    if (ii.w != g_dlss.inW || ii.h != g_dlss.inH || !IsDepthFormat(ii.fmt)) return;
+    static bool loggedCompute = false;
+    if (cs.gameCompute) {  // we'd replace the game's compute pipeline and sets; leave it to the motion pass
+        if (!loggedCompute) {
+            loggedCompute = true;
+            Log("[contour] the game uses compute where it copies its contour depth; the un-jittered depth is made "
+                "at the end of the frame instead (lines can trail the camera while it moves)");
+        }
+        return;
+    }
+    VkDescriptorSet srcSet = ContourSrcSet(d, view);
+    if (!srcSet) return;
+    ContourPush pc{};
+    FrameJitter(pc.jitter[0], pc.jitter[1]);
+    pc.size[0] = (int32_t)g_dlss.inW;
+    pc.size[1] = (int32_t)g_dlss.inH;
+    // waits for everything before it, including last frame's terrain draws reading contourImage
+    Barrier(d, cb, g_dlss.contourImage, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+    d->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_dlss.contourPipeline);
+    VkDescriptorSet sets[2] = {srcSet, g_dlss.contourOutSet};
+    d->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_dlss.contourPipeLayout, 0, 2, sets, 0, nullptr);
+    d->CmdPushConstants(cb, g_dlss.contourPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
+    d->CmdDispatch(cb, (g_dlss.inW + 7) / 8, (g_dlss.inH + 7) / 8, 1);
+    Barrier(d, cb, g_dlss.contourImage, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, RO);
+    g_contourWritten = true;
+    static uint64_t lastLogged = UINT64_MAX;
+    if (g_contourInFrame == UINT64_MAX || (lastLogged != UINT64_MAX && g_frame >= lastLogged + 6000)) {
+        Log("[contour] frame %llu: un-jittered the game's contour depth right after its copy (same frame, jitter "
+            "%.3f,%.3f)", (unsigned long long)g_frame, pc.jitter[0], pc.jitter[1]);
+        lastLogged = g_frame;
+    }
+    g_contourInFrame = g_frame;
 }
 
 // ---- contour_debug=1 (or Ctrl+Shift+C with debug_keys=1): what the contour lines are drawn from ------
@@ -6170,6 +6317,8 @@ static VKAPI_ATTR void VKAPI_CALL tf3_CmdBindPipeline(VkCommandBuffer cb, VkPipe
         cs.kind = cs.pipe ? cs.pipe->kind : Kind::Other;
         cs.pipeline = pipeline;
         if (!cs.pipe || !cs.pipe->vp.dynamic) cs.hasCurVp = false;  // static viewport replaces ours
+    } else if (bp == VK_PIPELINE_BIND_POINT_COMPUTE) {
+        CmdFor(cb).gameCompute = true;  // see ContourAfterGameBarrier
     }
     DeviceData* d = GetDevice(Key(cb));
     d->CmdBindPipeline(cb, bp, pipeline);
@@ -6239,6 +6388,10 @@ static VKAPI_ATTR void VKAPI_CALL tf3_CmdPipelineBarrier(VkCommandBuffer cb, VkP
         TLock lk(g_t);
         auto& cs = CmdFor(cb);
         for (uint32_t i = 0; i < imgCount; ++i) SetLayout(cs, img[i].image, img[i].newLayout);
+        DeviceData* d = GetDevice(Key(cb));
+        d->CmdPipelineBarrier(cb, src, dst, dep, memCount, mem, bufCount, buf, imgCount, img);
+        ContourAfterGameBarrier(d, cb, cs, imgCount, img);  // contour_fix: un-jitter the game's fresh depth copy
+        return;
     }
     GetDevice(Key(cb))->CmdPipelineBarrier(cb, src, dst, dep, memCount, mem, bufCount, buf, imgCount, img);
 }
@@ -6249,6 +6402,7 @@ static void BeginRp(VkCommandBuffer cb, const VkRenderPassBeginInfo* p) {
     auto& cs = CmdFor(cb);
     cs.fb = p->framebuffer;
     cs.rp = p->renderPass;
+    cs.inPass = true;
     cs.rcasInThisPass = false;
     cs.fbIsScene = false;
     cs.fbW = cs.fbH = 0;
@@ -6291,6 +6445,7 @@ static VKAPI_ATTR void VKAPI_CALL tf3_CmdBeginRenderPass2KHR(VkCommandBuffer cb,
 static void AfterEndRp(DeviceData* d, VkCommandBuffer cb) {
     TLock lk(g_t);
     auto& cs = CmdFor(cb);
+    cs.inPass = false;
     {
         PerfScope ps(kPerfPass);
         if (cs.hasSceneVp) {  // seen by ApplyViewport in this pass
