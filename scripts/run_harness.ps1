@@ -5,8 +5,10 @@
 #   .\run_harness.ps1 -TestUpscaler   a plain resize instead of DLSS / FSR (as in CI)
 #   .\run_harness.ps1 -Validation     also with the Khronos validation layer (Vulkan SDK) below ours
 #   .\run_harness.ps1 -Threads 8      threads recording the scene (default 4)
+# Runs city_off / city_on: -Vehicles (default 12000, about a busy TF3 city; 1 in 20 moving) with object_motion 0 and 1; on this PC's GPU
+# their [perf] GPU lines show what object motion costs without starting the game.
 # Output in logs\harness\<run>: fake_tf3.txt (results), tf3_dlss.log, last_frame.ppm, mvcap\.
-param([switch]$TestUpscaler, [switch]$Validation, [int]$Threads = 4, [int]$Frames = 300)
+param([switch]$TestUpscaler, [switch]$Validation, [int]$Threads = 4, [int]$Frames = 300, [int]$Vehicles = 12000, [int]$CostFrames = 1500)
 $ErrorActionPreference = 'Stop'
 $root   = Split-Path -Parent $PSScriptRoot
 $bin    = Join-Path $root 'build\bin'
@@ -21,6 +23,10 @@ if (-not (Test-Path $vcvars)) {
     }
 }
 if (-not (Test-Path (Join-Path $bin 'VkLayer_tf3_dlss.dll'))) { throw 'build\bin\VkLayer_tf3_dlss.dll not found: run build.ps1 first' }
+# The harness tests the mod as build.ps1 last built it: say so when the sources are newer.
+$dll = Get-Item (Join-Path $bin 'VkLayer_tf3_dlss.dll')
+$newer = Get-ChildItem (Join-Path $root 'layer') -Recurse -File | Where-Object { $_.LastWriteTime -gt $dll.LastWriteTime }
+if ($newer) { Write-Host "build\bin\VkLayer_tf3_dlss.dll is older than the layer's sources: run build.ps1 first to test your changes" -ForegroundColor Yellow }
 $src = Join-Path $root 'harness'
 cmd /s /c "`"$vcvars`" >nul && cmake -S `"$src`" -B `"$build`" -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build `"$build`""
 if ($LASTEXITCODE -ne 0) { throw "Building fake_tf3 failed (exit $LASTEXITCODE)" }
@@ -63,11 +69,31 @@ function Run([string]$name, [string]$cfg, [string]$withLayers, [string[]]$opts) 
 
 $vopt = @()
 if ($Validation) { $vopt = @('--validation') }
-Run 'checks' 'log_every=100' $layers $vopt
-Run 'perf' "perf=1`nperf_seconds=5" 'VK_LAYER_TF3_dlss' @()
+# object_motion=1: the default, set here so the checks cover the object pass whatever the default
+Run 'checks' "log_every=100`nobject_motion=1" $layers $vopt
+# The cost runs are longer, with a [perf] report every 2 s: a GPU does 300 frames in about a second.
+$cost = @('--frames', "$CostFrames")
+Run 'perf' "perf=1`nperf_seconds=2`nobject_motion=1" 'VK_LAYER_TF3_dlss' $cost
 Run 'no_layer' '' '' @('--no-checks')
+Remove-Item Env:TF3_DLSS_CAPTURE -ErrorAction SilentlyContinue   # no recordings in the cost runs
+Run 'city_off' "perf=1`nperf_seconds=2`nobject_motion=0" 'VK_LAYER_TF3_dlss' ($cost + @('--vehicles', "$Vehicles", '--no-checks'))
+Run 'city_on' "perf=1`nperf_seconds=2`nobject_motion=1" 'VK_LAYER_TF3_dlss' ($cost + @('--vehicles', "$Vehicles", '--no-checks'))
 Write-Host ''
 Write-Host 'CPU time per frame for recording, with and without the layer:'
 Select-String -Path (Join-Path $out 'perf\fake_tf3.txt'), (Join-Path $out 'no_layer\fake_tf3.txt') -Pattern 'CPU time per frame' | ForEach-Object { $_.Line }
+# 'py' is the Python launcher; a bare 'python' can be the Microsoft Store placeholder, which prints nothing.
+$summary = Join-Path $out 'summary.md'
+$md = $null
+foreach ($cmd in @('py', 'python3', 'python')) {
+    if (-not (Get-Command $cmd -ErrorAction SilentlyContinue)) { continue }
+    $md = & $cmd (Join-Path $src 'summary.py') $out 2>$null | Out-String
+    if ($md.Trim()) { break }
+}
+if ($md -and $md.Trim()) {
+    $md | Out-File -Encoding utf8 $summary
+    Write-Host "Summary, with what object motion costs: $summary"
+} else {
+    Write-Host 'No Python found (the summary needs it): compare the [perf] GPU lines of city_off and city_on above'
+}
 if ($failed) { Write-Host "harness: FAILED (details in $out)" -ForegroundColor Red; exit 1 }
 Write-Host 'harness: all runs passed' -ForegroundColor Green

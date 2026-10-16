@@ -8,7 +8,9 @@
 //
 // The scene is a flat checkerboard wall facing the camera and a cube sliding sideways in front of
 // it, with a second, parked copy of the cube above it in the same draw (the layer leaves out the
-// copies that don't move). The camera stands still, then pans sideways, then up, so the motion vectors the layer
+// copies that don't move). With --vehicles N it also draws N small "vehicles" (kCityModels models,
+// one instanced draw each, 1 in 20 moving), like a busy TF3 city, for measuring what object motion
+// costs. The camera stands still, then pans sideways, then up, so the motion vectors the layer
 // records (TF3_DLSS_CAPTURE) can be checked against exact values.
 //
 // After the run it checks (exit code 0 = all passed, 1 = a check failed, 2 = it couldn't run):
@@ -23,7 +25,7 @@
 // and reports its own CPU time per frame for recording, which the layer's hooks add to.
 //
 // Usage: fake_tf3 [--out DIR] [--frames N] [--width W --height H] [--scale S] [--tiles X Y]
-//                 [--threads N] [--window] [--validation] [--no-checks]
+//                 [--threads N] [--vehicles N] [--window] [--validation] [--no-checks]
 // The scripts (harness/run.sh, scripts/run_harness.ps1) enable the layer and set its variables.
 
 #ifdef _WIN32
@@ -89,6 +91,7 @@ struct Options {
     float scale = 0.5f;                    // render size = scale * output size
     uint32_t tilesX = 64, tilesY = 24;     // the wall is drawn as tilesX * tilesY separate draws
     uint32_t threads = 4;                  // threads recording the scene (TF3 records on several)
+    uint32_t vehicles = 0;                 // --vehicles: city traffic for the object motion cost
     bool window = false, validation = false, checks = true;
 } g_opt;
 
@@ -463,7 +466,9 @@ void CreateSwapchain() {
     VkSurfaceCapabilitiesKHR caps;
     VKC(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g.gpu, g.surface, &caps));
     g.out = caps.currentExtent.width != UINT32_MAX ? caps.currentExtent : VkExtent2D{g_opt.width, g_opt.height};
-    g.render = {(uint32_t)std::lround(g.out.width * g_opt.scale), (uint32_t)std::lround(g.out.height * g_opt.scale)};
+    // The render size follows the size asked for, not the window: Windows can shrink the window (borders, a
+    // smaller screen), and below 1000 pixels wide the layer doesn't take the depth image as the game's.
+    g.render = {(uint32_t)std::lround(g_opt.width * g_opt.scale), (uint32_t)std::lround(g_opt.height * g_opt.scale)};
     if (!(caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT)) Die("swapchain images can't be read back");
 
     uint32_t n = 0;
@@ -830,6 +835,7 @@ int main(int argc, char** argv) {
         else if (a == "--scale") g_opt.scale = (float)std::atof(next());
         else if (a == "--tiles") g_opt.tilesX = (uint32_t)std::atoi(next()), g_opt.tilesY = (uint32_t)std::atoi(next());
         else if (a == "--threads") g_opt.threads = std::max(1, std::atoi(next()));
+        else if (a == "--vehicles") g_opt.vehicles = (uint32_t)std::max(0, std::atoi(next()));
         else if (a == "--window") g_opt.window = true;
         else if (a == "--validation") g_opt.validation = true;
         else if (a == "--no-checks") g_opt.checks = false;
@@ -848,6 +854,8 @@ int main(int argc, char** argv) {
     std::printf("fake_tf3: %s, render %ux%u -> output %ux%u, %u wall draws + 1 draw of 2 cubes on %u threads, %u frames\n",
                 g.props.deviceName, g.render.width, g.render.height, g.out.width, g.out.height,
                 g_opt.tilesX * g_opt.tilesY, g_opt.threads, g_opt.frames);
+    if (g_opt.vehicles)
+        std::printf("fake_tf3: plus %u vehicles (1 in 20 moving) in 48 instanced draws\n", g_opt.vehicles);
 
     // ---- images: TF3's formats (B10G11R11 HDR and tonemapped colour, D24S8 depth) ----
     const VkFormat kHdr = VK_FORMAT_B10G11R11_UFLOAT_PACK32, kPost = VK_FORMAT_R8G8B8A8_UNORM;
@@ -921,12 +929,13 @@ int main(int argc, char** argv) {
     VkSampler sampler;
     VKC(vkCreateSampler(g.dev, &sci, nullptr, &sampler));
 
-    Buffer viewUbo[kInFlight], inst[kInFlight];
+    Buffer viewUbo[kInFlight], inst[kInFlight], cityInst[kInFlight];
     uint32_t tiles = g_opt.tilesX * g_opt.tilesY;
     VkDescriptorSet viewSet[kInFlight];
     for (uint32_t i = 0; i < kInFlight; ++i) {
         viewUbo[i] = MakeBuffer(sizeof(ViewUbo), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
         inst[i] = MakeBuffer((VkDeviceSize)(tiles + 2) * 64, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+        if (g_opt.vehicles) cityInst[i] = MakeBuffer((VkDeviceSize)g_opt.vehicles * 64, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
         viewSet[i] = alloc(dslView);
     }
     Buffer mat = MakeBuffer(kMaterials * kMatStride, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
@@ -1018,6 +1027,35 @@ int main(int argc, char** argv) {
     std::memcpy(quadIb.ptr, quadI, sizeof quadI);
     std::memcpy(cubeVb.ptr, cubeV, sizeof cubeV);
     std::memcpy(cubeIb.ptr, cubeI, sizeof cubeI);
+    // Vehicles: a box with each face cut into kVehGrid x kVehGrid quads (game vehicles have many
+    // triangles), and kCityModels copies of its indices, so each model is its own mesh to the layer.
+    constexpr uint32_t kVehGrid = 4, kCityModels = 48;
+    std::vector<float> vehV;
+    std::vector<uint16_t> vehI1;
+    for (int face = 0; face < 6; ++face) {
+        int ax = face / 2;
+        float sgn = face % 2 ? 1.f : -1.f;
+        uint16_t base = (uint16_t)(vehV.size() / 3);
+        for (uint32_t v = 0; v <= kVehGrid; ++v)
+            for (uint32_t u = 0; u <= kVehGrid; ++u) {
+                float p[3], a = -1.f + 2.f * u / kVehGrid, b = -1.f + 2.f * v / kVehGrid;
+                p[ax] = sgn, p[(ax + 1) % 3] = a, p[(ax + 2) % 3] = b;
+                vehV.insert(vehV.end(), {p[0] * 1.6f, p[1] * 0.6f, p[2] * 0.7f});  // car-ish proportions
+            }
+        for (uint32_t v = 0; v < kVehGrid; ++v)
+            for (uint32_t u = 0; u < kVehGrid; ++u) {
+                uint16_t i0 = (uint16_t)(base + v * (kVehGrid + 1) + u), i1 = i0 + 1,
+                         i2 = (uint16_t)(i0 + kVehGrid + 1), i3 = i2 + 1;
+                vehI1.insert(vehI1.end(), {i0, i1, i3, i0, i3, i2});
+            }
+    }
+    const uint32_t vehIdx = (uint32_t)vehI1.size();
+    std::vector<uint16_t> vehI;
+    for (uint32_t m = 0; m < kCityModels; ++m) vehI.insert(vehI.end(), vehI1.begin(), vehI1.end());
+    Buffer vehVb = MakeBuffer(vehV.size() * 4, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT),
+           vehIb = MakeBuffer(vehI.size() * 2, VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+    std::memcpy(vehVb.ptr, vehV.data(), vehV.size() * 4);
+    std::memcpy(vehIb.ptr, vehI.data(), vehI.size() * 2);
     // The wall: 80 x 30 units, wide enough for the pan.
     const float wallW = 80.f, wallH = 30.f, tileW = wallW / g_opt.tilesX, tileH = wallH / g_opt.tilesY;
 
@@ -1093,6 +1131,14 @@ int main(int argc, char** argv) {
                                                  Scale(tileW, tileH, 1.f));
         im[tiles] = Translate(CubeX(f), 0.f, kCubeZ);
         im[tiles + 1] = Translate(kParkedX, kParkedY, kCubeZ);
+        // vehicles: rows in front of the wall, 1 in 20 driving back and forth, the rest parked
+        Mat4* vm = (Mat4*)cityInst[slot].ptr;
+        for (uint32_t i = 0; i < g_opt.vehicles; ++i) {
+            uint32_t col = i % 160, row = i / 160 % 60, layer = i / 9600;
+            float x = -wallW / 2 + (col + .5f) * wallW / 160, y = -wallH / 2 + (row + .5f) * wallH / 60;
+            if (i % 20 == 0) x += 0.4f * std::sin(0.05f * (float)f + (float)i);
+            vm[i] = Mul(Translate(x, y, -16.f - 0.5f * (float)layer), Scale(0.12f, 0.12f, 0.12f));
+        }
 
         auto t0 = std::chrono::steady_clock::now();
         VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
@@ -1182,6 +1228,16 @@ int main(int argc, char** argv) {
                 uint32_t off = (t % (kMaterials - 1)) * kMatStride;
                 vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, plScene, 1, 1, &matSet, 1, &off);
                 vkCmdDrawIndexed(cb, 6, 1, 0, 0, t);
+            }
+            if (g_opt.vehicles) {  // this part's vehicle models, one instanced draw each
+                uint32_t carOff = (kMaterials - 1) * kMatStride, per = g_opt.vehicles / kCityModels;
+                vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, plScene, 1, 1, &matSet, 1, &carOff);
+                vkCmdBindVertexBuffers(cb, 0, 1, &vehVb.buf, &zero);
+                vkCmdBindVertexBuffers(cb, 1, 1, &cityInst[slot].buf, &zero);
+                vkCmdBindIndexBuffer(cb, vehIb.buf, 0, VK_INDEX_TYPE_UINT16);
+                for (uint32_t m = part; m < kCityModels; m += nThreads)
+                    if (per) vkCmdDrawIndexed(cb, vehIdx, per, m * vehIdx, 0, m * per);
+                vkCmdBindVertexBuffers(cb, 1, 1, &inst[slot].buf, &zero);
             }
             if (part + 1 == nThreads) {
                 uint32_t cubeOff = (kMaterials - 1) * kMatStride;
@@ -1355,7 +1411,7 @@ int main(int argc, char** argv) {
     bool allPass = true;
     std::ofstream js(g_opt.out / "result.json");
     js << "{\n  \"gpu\": \"" << g.props.deviceName << "\",\n  \"render\": [" << g.render.width << ", " << g.render.height
-       << "],\n  \"output\": [" << g.out.width << ", " << g.out.height << "],\n  \"draws\": " << tiles + 1
+       << "],\n  \"output\": [" << g.out.width << ", " << g.out.height << "],\n  \"draws\": " << tiles + 1 + (g_opt.vehicles ? 48 : 0) << ",\n  \"vehicles\": " << g_opt.vehicles
        << ",\n  \"frames\": " << g_opt.frames << ",\n  \"record_ms\": " << recordMs << ",\n  \"frame_ms\": " << frameMs
        << ",\n  \"checks\": [";
     for (size_t i = 0; i < g_checks.size(); ++i) {

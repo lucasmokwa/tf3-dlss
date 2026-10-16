@@ -25,6 +25,9 @@
 #define TF3_DLSS_VERSION "0.1.0"
 
 #include <vulkan/vulkan.h>
+#if defined(_M_X64) || defined(__x86_64__)
+#include <immintrin.h>
+#endif
 #include <vulkan/vk_layer.h>
 
 #include "nvsdk_ngx_vk.h"
@@ -1988,6 +1991,30 @@ char* RefData(VkBuffer buf, VkDeviceSize off) {
     return mi->second.ptr + (at - mi->second.offset);
 }
 
+// Copies n bytes out of the game's mapped memory. That memory is usually write-combined (HOST_VISIBLE
+// without HOST_CACHED): the CPU writes it fast but reads it uncached, so plain loads of instance data cost
+// a round trip each (12000 vehicles: about 20 ms per frame on an RTX 3080). Streaming loads (SSE4.1)
+// read it a cache line at a time instead; on cached memory they're ordinary loads. The 16-byte blocks
+// read around src and src + n never cross a page, so they stay inside the mapping.
+#if defined(_M_X64) || defined(__x86_64__)
+#if defined(__GNUC__)
+__attribute__((target("sse4.1")))
+#endif
+static void CopyFromMapped(void* dst, const char* src, size_t n) {
+    if (!n) return;
+    const uintptr_t a = (uintptr_t)src & ~(uintptr_t)15, end = ((uintptr_t)src + n + 15) & ~(uintptr_t)15;
+    struct alignas(16) Block { char b[16]; };
+    thread_local std::vector<Block> tmp;
+    tmp.resize((end - a) / 16);
+    _mm_mfence();  // the game's earlier writes come first
+    for (size_t i = 0; i < tmp.size(); ++i)
+        _mm_store_si128(reinterpret_cast<__m128i*>(&tmp[i]), _mm_stream_load_si128(reinterpret_cast<__m128i*>(a + i * 16)));
+    std::memcpy(dst, reinterpret_cast<const char*>(tmp.data()) + ((uintptr_t)src - a), n);
+}
+#else
+static void CopyFromMapped(void* dst, const char* src, size_t n) { std::memcpy(dst, src, n); }
+#endif
+
 // Jitter an inverse view-projection: Inv' = Inv * T^-1, T = translate(dx*w, dy*w) in NDC (only the
 // fourth column changes). Used to reconstruct positions from the jittered depth buffer.
 void JitterInverse(float* m, float dx, float dy) {
@@ -2893,8 +2920,17 @@ void ObjFillPrev(CmdState& cs) {
         for (const auto& [mesh, list] : g_objPrev)
             for (const auto& m : list) exact.emplace(exactKey(mesh, m.data()), m.data());
     uint64_t drawn = 0;
+    thread_local std::vector<char> copy;  // this draw's instance data, read out of the game's memory at once
     for (const ObjDraw& od : cs.objDraws) {
         char* src = RefData(od.mdlBuf, od.mdlOff);
+        if (src && od.instances) {
+            size_t span = 0;
+            for (int c = 0; c < 4; ++c) span = std::max(span, (size_t)od.layout.colOffset[c] + 16);
+            span += (size_t)(od.instances - 1) * od.layout.stride;
+            copy.resize(span);
+            CopyFromMapped(copy.data(), src, span);
+            src = copy.data();
+        }
         auto& list = next[od.mesh];
         auto pp = havePrev ? g_objPrev.find(od.mesh) : g_objPrev.end();
         bool anyMoved = false;
@@ -6422,13 +6458,25 @@ void ProbeCollect(CmdState& cs) {
         auto bi = g_buffers.find(p.buf);
         if (!base || bi == g_buffers.end()) continue;
         const Mapping& mp = g_mapped[bi->second.memory];
-        for (uint32_t i = 0; i < p.count && i < 4096; ++i) {
+        // read the instances in one go (see CopyFromMapped), as far as the mapping goes
+        uint32_t n = std::min(p.count, 4096u);
+        VkDeviceSize from = (VkDeviceSize)p.first * p.stride, to = from + (VkDeviceSize)n * p.stride;
+        if (mp.size != VK_WHOLE_SIZE) {
+            VkDeviceSize mapEnd = mp.offset + mp.size, at = bi->second.memOffset + p.base;
+            to = std::min(to, mapEnd > at ? mapEnd - at : 0);
+        }
+        thread_local std::vector<char> copy;
+        if (to > from) {
+            copy.resize((size_t)(to - from));
+            CopyFromMapped(copy.data(), base + from, copy.size());
+        }
+        for (uint32_t i = 0; i < n; ++i) {
             VkDeviceSize off = (VkDeviceSize)(p.first + i) * p.stride;
             if (!g_probeCur.seen.insert(Mix((uint64_t)(uintptr_t)p.buf, p.base + off)).second) continue;
             VkDeviceSize end = bi->second.memOffset + p.base + off + p.colOffset[3] + 12;
             if (mp.size != VK_WHOLE_SIZE && end > mp.offset + mp.size) break;
             float t[3];
-            std::memcpy(t, base + off + p.colOffset[3], 12);  // translation = 4th column
+            std::memcpy(t, copy.data() + (off - from) + p.colOffset[3], 12);  // translation = 4th column
             g_probeCur.inst.push_back({p.mesh, t[0], t[1], t[2]});
         }
     }

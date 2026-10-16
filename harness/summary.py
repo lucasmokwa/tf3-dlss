@@ -3,7 +3,8 @@
 
     harness/summary.py OUT_DIR [BASELINE_METRICS_JSON] > summary.md
 
-Reads OUT_DIR/<run>/result.json (fake_tf3) and the last [perf] report in OUT_DIR/perf/tf3_dlss.log,
+Reads OUT_DIR/<run>/result.json (fake_tf3) and the last [perf] report in OUT_DIR/perf/tf3_dlss.log
+(and in city_off / city_on: the busy-city scene with object_motion 0 and 1),
 and writes the cost numbers to OUT_DIR/metrics.json. With a metrics.json from an earlier run (CI
 passes the latest main build's), the cost tables get that run's numbers and the change next to them.
 The numbers are from Mesa's CPU driver (lavapipe) on a CI runner: compare them between runs, not
@@ -60,6 +61,28 @@ for line in report:
     r = re.search(r"waited for the layer's lock (\d+) times per frame, ([\d.]+) ms", line)
     if r:
         m["lock"] = {"waits per frame": int(r.group(1)), "ms waiting": float(r.group(2))}
+
+
+def city(name):
+    """frame time, the layer's CPU and GPU time per frame in a city run."""
+    r, rep_ = result(name), last_perf_report(out / name / "tf3_dlss.log")
+    v = {"frame time": r.get("frame_ms") if r else None, "layer CPU": None, "layer GPU": None}
+    for line in rep_:
+        x = re.search(r"layer CPU: ([\d.]+) ms per frame", line)
+        if x:
+            v["layer CPU"] = float(x.group(1))
+        x = re.search(r"GPU: the layer's passes ([\d.]+) ms per frame", line)
+        if x:
+            v["layer GPU"] = float(x.group(1))
+        x = re.search(r"object motion ([\d.]+)", line)
+        if x:
+            v["GPU object motion"] = float(x.group(1))
+    return v
+
+
+cityOff, cityOn = city("city_off"), city("city_on")
+m["object_motion_cost"] = {k: cityOn[k] - cityOff[k] for k in cityOff
+                           if isinstance(cityOn[k], (int, float)) and isinstance(cityOff[k], (int, float))}
 (out / "metrics.json").write_text(json.dumps(m, indent=2) + "\n")
 
 
@@ -96,6 +119,8 @@ md = ["## Test harness", "", "| run | result |", "|---|---|"]
 failed = []
 for name in ("checks", "skip_fsr", "perf"):
     r = result(name)
+    if r is None and not (out / name).exists():
+        continue  # not part of this run (scripts\run_harness.ps1 has no skip_fsr run)
     if r is None:
         md.append(f"| {name} | no result (crashed or didn't run) |")
         failed.append(f"{name}: no result")
@@ -118,6 +143,17 @@ md += table("layer CPU per frame (its `[perf]` report)", "layer_ms", bold=("all"
 md += table("lock", "lock", unit="")
 if m["calls"]:
     md += ["Calls per frame: " + ", ".join(f"{k} {v}" for k, v in m["calls"].items()) + ".", ""]
+if m["object_motion_cost"]:
+    veh = (result("city_on") or {}).get("vehicles", "?")
+    md += ["### What object motion costs", "",
+           f"Busy city: {veh} vehicles in 48 models, 1 in 20 moving, with `object_motion=0` and `=1` (the default).", "",
+           "| per frame | object_motion=0 | object_motion=1 | **cost** |" + (" cost on main | change |" if base else ""),
+           "|---|---|---|---|" + ("---|---|" if base else "")]
+    was = (base or {}).get("object_motion_cost", {})
+    for k, c in m["object_motion_cost"].items():
+        md.append(f"| {k} | {num(cityOff[k])} | {num(cityOn[k])} | **{num(c)}** |"
+                  + (f" {num(was.get(k))} | {change(c, was.get(k))} |" if base else ""))
+    md.append("")
 if report:
     md += ["<details><summary>Full [perf] report</summary>", "", "```"] + report + ["```", "", "</details>", ""]
 else:

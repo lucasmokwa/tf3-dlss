@@ -10,6 +10,8 @@
 #   skip_fsr   the same with skip_game_fsr=1 and contour_debug=1
 #   perf       without validation, perf=1: the layer's [perf] report
 #   no_layer   fake_tf3 alone, to compare its CPU time per frame with "perf"
+#   city_off   perf=1 with 2400 vehicles (1 in 20 moving), object_motion=0 (the default)
+#   city_on    the same with object_motion=1: the difference is what object motion costs
 # OUT_DIR/summary.md: the checks and the layer's cost in Markdown (CI shows it on the run's page).
 # Exit code 0 only if every check passed.
 set -u
@@ -41,7 +43,8 @@ run() {  # name, extra cfg lines, layers, fake_tf3 options...
   cp "$here/../tf3_dlss.cfg" "$dir/tf3_dlss.cfg"
   printf '\n# test harness\n%b\n' "$cfg" >> "$dir/tf3_dlss.cfg"
   echo "== $name"
-  TF3_DLSS_CFG="$dir/tf3_dlss.cfg" TF3_DLSS_LOG="$dir/tf3_dlss.log" VK_INSTANCE_LAYERS="$layers" \
+  TF3_DLSS_CAPTURE="${CAP-$TF3_DLSS_CAPTURE}" \
+    TF3_DLSS_CFG="$dir/tf3_dlss.cfg" TF3_DLSS_LOG="$dir/tf3_dlss.log" VK_INSTANCE_LAYERS="$layers" \
     "$build/fake_tf3" --out "$dir" "$@" 2>&1 | tee "$dir/fake_tf3.txt"
   local rc=${PIPESTATUS[0]}
   [ "$rc" -ne 0 ] && status=1
@@ -51,10 +54,13 @@ run() {  # name, extra cfg lines, layers, fake_tf3 options...
 vopt=""
 [ -n "$validation" ] && vopt="--validation"
 with_val="VK_LAYER_TF3_dlss${validation:+:$validation}"
-run checks "log_every=100" "$with_val" $vopt
-run skip_fsr "skip_game_fsr=1\ncontour_debug=1" "$with_val" $vopt
-run perf "perf=1\nperf_seconds=5" "VK_LAYER_TF3_dlss"
+# object_motion=1 in checks, skip_fsr and perf: the default, set here so the checks cover the object pass whatever the default
+run checks "log_every=100\nobject_motion=1" "$with_val" $vopt
+run skip_fsr "skip_game_fsr=1\nobject_motion=1\ncontour_debug=1" "$with_val" $vopt
+run perf "perf=1\nperf_seconds=5\nobject_motion=1" "VK_LAYER_TF3_dlss"
 run no_layer "" "" --no-checks
+CAP= run city_off "perf=1\nperf_seconds=5\nobject_motion=0" "VK_LAYER_TF3_dlss" --vehicles 2400 --no-checks
+CAP= run city_on "perf=1\nperf_seconds=5\nobject_motion=1" "VK_LAYER_TF3_dlss" --vehicles 2400 --no-checks
 echo
 echo "CPU time per frame for recording, with and without the layer:"
 grep -h 'CPU time per frame' "$out/perf/fake_tf3.txt" "$out/no_layer/fake_tf3.txt"
