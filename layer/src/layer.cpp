@@ -16,7 +16,8 @@
 //   * Camera motion vectors from depth (compute), object motion by redrawing moving models with
 //     last frame's model matrix, sub-pixel jitter through the scene viewport.
 //   * Settings: tf3_dlss.cfg in the mod folder (or %TF3_DLSS_CFG%), reloaded live when cfg_live=1.
-//     Log: tf3_dlss.log in the mod folder (or %TF3_DLSS_LOG%), falling back to %TEMP%.
+//     Log: tf3_dlss.log in the mod folder (or %TF3_DLSS_LOG%), falling back to %TEMP%. The previous
+//     session's log is kept as tf3_dlss.previous.log.
 // Detailed logging: first 3 frames after the game's FSR pass first runs, then every log_every frames.
 //
 // Copyright (c) 2026 Lucas. MIT license (see LICENSE).
@@ -180,11 +181,18 @@ void Log(const char* fmt, ...) {
         if (env && *env) paths.push_back(std::filesystem::path(env).wstring());
         paths.push_back(RootDir() + L"\\tf3_dlss.log");
         paths.push_back(TempDir() + L"\\tf3_dlss.log");  // mod folder not writable (e.g. Program Files)
-        for (const auto& p : paths)
+        for (const auto& p : paths) {
+            // Keep the last session's log as tf3_dlss.previous.log, so restarting the game after a crash
+            // doesn't wipe the lines that explain it.
+            std::error_code ec;
+            std::filesystem::path prev(p);
+            prev.replace_extension(L".previous.log");
+            if (std::filesystem::exists(p, ec)) std::filesystem::rename(p, prev, ec);
             if ((g_log = OpenFile(p, L"w"))) {
                 g_logPath = p;
                 break;
             }
+        }
         if (!g_log) return;
     }
     va_list ap;
