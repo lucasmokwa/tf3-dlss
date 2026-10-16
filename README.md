@@ -57,7 +57,7 @@ The rest of this page is for developers.
 | Find the passes | Recognises the game's tonemap, FSR EASU/RCAS and final blit by their SPIR-V debug names |
 | Jitter | Shifts the 3D scene's viewport by a sub-pixel Halton offset each frame (overlays and UI aren't touched) |
 | Camera motion | Compute pass: rebuilds each pixel's previous screen position from depth and the camera matrices |
-| Object motion | Finds moving models (vehicles) and redraws them into the motion-vector image with last frame's model matrix |
+| Object motion | Finds moving models (vehicles) and redraws them into the motion-vector image with last frame's model matrix. The GPU copies the game's per-object data and matches each object with last frame's (`obj_track.comp`), so the CPU doesn't read the game's memory for it |
 | Upscale | After RCAS, records DLSS or FSR 3.1 into the game's command buffer, then swaps the blit's input for the upscaled image |
 | Extras | Texture LOD bias, sharpening (CAS-style for DLSS, RCAS for FSR), hover-highlight depth fix |
 

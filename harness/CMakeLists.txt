@@ -50,7 +50,7 @@ if(NOT WIN32)
   set(DLSS_SDK "$ENV{HOME}/DLSS" CACHE PATH "NVIDIA DLSS SDK folder (only its headers are used here)")
   set(LAYER_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../layer")
   compile_shaders(LAYER_SHADERS "${LAYER_DIR}/shaders"
-    camera_mv.comp mv_debug.comp sharpen.comp overlay.comp test_upscale.comp object_mv.vert object_mv.frag)
+    camera_mv.comp mv_debug.comp sharpen.comp overlay.comp test_upscale.comp object_mv.vert object_mv.frag obj_track.comp)
   add_library(VkLayer_tf3_dlss SHARED "${LAYER_DIR}/src/layer.cpp" ngx_stub.cpp ${LAYER_SHADERS})
   target_include_directories(VkLayer_tf3_dlss PRIVATE "${DLSS_SDK}/include" "${GEN_DIR}"
                              "${LAYER_DIR}/../third_party/ffx-api/include")

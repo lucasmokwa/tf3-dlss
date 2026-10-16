@@ -1,0 +1,100 @@
+#version 450
+// Object motion, matching on the GPU: for every instance the object pass replays this frame, find the
+// same object in last frame's list and write its previous model matrix for object_mv.vert.
+//
+// The layer copies the game's per-instance data (instAttrModel) of the replayed draws into `raw` with
+// vkCmdCopyBuffer just before this runs, so the CPU never reads the game's memory. Draws of the same
+// mesh sit next to each other, and the CPU passes each draw last frame's range of that mesh.
+// Matching, as the CPU did it before: the copy of the same mesh nearest to where it was predicted
+// (last position + last frame's movement), within kObjMatchDist, or 1.5x its last movement for fast
+// objects. An exact position match wins at once (parked and waiting vehicles: almost all of them).
+// No match: this frame's matrix, which object_mv.vert treats as "didn't move" (camera motion only).
+
+layout(local_size_x = 64) in;
+
+struct Draw {
+    uint rawOff;      // first instance in `raw`, in uints
+    uint stride;      // between instances, in uints
+    uint col[4];      // instAttrModel column c at rawOff + i * stride + col[c]
+    uint instances;
+    uint dst;         // first entry in prevOut / the track lists
+    uint cmd;         // its indirect draw command
+    uint prevStart;   // last frame's instances of this mesh in the previous track list
+    uint prevCount;
+    uint pad;
+};
+struct Track {
+    mat4 m;    // model matrix
+    vec4 vel;  // xyz: movement since the frame before (0 if it wasn't matched)
+};
+
+layout(std430, set = 0, binding = 0) readonly buffer Raw { uint raw[]; };
+layout(std430, set = 0, binding = 1) readonly buffer Draws { Draw draws[]; };
+layout(std430, set = 0, binding = 2) buffer Tracks { Track track[]; };  // two lists: last frame's, this frame's
+layout(std430, set = 0, binding = 3) writeonly buffer PrevOut { mat4 prevOut[]; };
+layout(std430, set = 0, binding = 4) buffer Ind { uint ind[]; };  // indirect commands, 5 uints each
+layout(std430, set = 0, binding = 5) buffer Stats { uint stats[]; };  // moved, unmatched per slot
+
+layout(push_constant) uniform PC {
+    uint drawBase, drawCount;   // this frame's draws in `draws`
+    uint instanceCount;
+    uint prevBase, curBase;     // the two lists in `track`
+    uint indBase;               // this frame's commands in `ind`, in uints
+    uint statsBase;
+    float matchDist;
+} pc;
+
+vec4 Col(uint at) {
+    return vec4(uintBitsToFloat(raw[at]), uintBitsToFloat(raw[at + 1]), uintBitsToFloat(raw[at + 2]),
+                uintBitsToFloat(raw[at + 3]));
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.instanceCount) return;
+    // the draw this instance belongs to (draws are in dst order)
+    uint lo = 0, hi = pc.drawCount - 1;
+    while (lo < hi) {
+        uint mid = (lo + hi + 1) / 2;
+        if (draws[pc.drawBase + mid].dst <= i) lo = mid;
+        else hi = mid - 1;
+    }
+    Draw d = draws[pc.drawBase + lo];
+    uint j = i - d.dst;
+    uint at = d.rawOff + j * d.stride;
+    mat4 cur = mat4(Col(at + d.col[0]), Col(at + d.col[1]), Col(at + d.col[2]), Col(at + d.col[3]));
+    vec3 pos = cur[3].xyz;
+
+    int best = -1;
+    float bestD2 = 1e30;
+    for (uint k = 0; k < d.prevCount; ++k) {
+        Track p = track[pc.prevBase + d.prevStart + k];
+        vec3 was = p.m[3].xyz;
+        if (was == pos) {  // still there
+            best = int(k);
+            break;
+        }
+        vec3 dv = was + p.vel.xyz - pos;
+        float d2 = dot(dv, dv);
+        float r = max(pc.matchDist, 1.5 * length(p.vel.xyz));
+        if (d2 < r * r && d2 < bestD2) {
+            bestD2 = d2;
+            best = int(k);
+        }
+    }
+    mat4 prev = cur;
+    vec3 vel = vec3(0.0);
+    if (best >= 0) {
+        prev = track[pc.prevBase + d.prevStart + uint(best)].m;
+        vel = pos - prev[3].xyz;
+    }
+    track[pc.curBase + i].m = cur;
+    track[pc.curBase + i].vel = vec4(vel, 0.0);
+    prevOut[i] = prev;
+    if (best < 0) atomicAdd(stats[pc.statsBase + 1], 1u);
+    else if (prev != cur) {
+        // draw this command: one of its instances moved (a plain store, every thread writes the same)
+        ind[pc.indBase + d.cmd * 5u + 1u] = d.instances;
+        atomicAdd(stats[pc.statsBase], 1u);
+    }
+}
