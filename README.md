@@ -27,7 +27,8 @@ switches between DLSS and FSR.
 **Uninstall:** delete `version.dll` and the `TF3-DLSS` folder from the game folder.
 **Not working?** See `TF3-DLSS\README.txt`. If the mod couldn't start, it leaves a
 `TF3-DLSS-DID-NOT-START.txt` in the `TF3-DLSS` folder that says why. Bug reports: attach `tf3_dlss.log` from the same
-folder, with your GPU and resolution scale.
+folder, with your GPU and resolution scale. After a crash and a restart, the crashed session's log is
+`tf3_dlss.previous.log`.
 
 ### What is version.dll?
 
