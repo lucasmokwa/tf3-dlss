@@ -445,6 +445,9 @@ struct InstanceData {
     X(CreateRenderPass2)                      \
     X(CreateRenderPass2KHR)                   \
     X(CreateSwapchainKHR)                     \
+    X(DestroyBuffer)                          \
+    X(AllocateMemory)                         \
+    X(FreeMemory)                             \
     X(BindBufferMemory)                       \
     X(BindBufferMemory2)                      \
     X(BindBufferMemory2KHR)                   \
@@ -482,7 +485,6 @@ struct InstanceData {
 // ... and functions we only call ourselves.
 #define DEVICE_CALLS(X)            \
     X(GetImageMemoryRequirements)  \
-    X(AllocateMemory)              \
     X(BindImageMemory)             \
     X(CreateDescriptorPool)        \
     X(CmdClearColorImage)          \
@@ -614,7 +616,8 @@ struct BufferInfo {
 struct Mapping {
     char* ptr = nullptr;
     VkDeviceSize offset = 0;
-    VkDeviceSize size = VK_WHOLE_SIZE;
+    VkDeviceSize size = VK_WHOLE_SIZE;  // as mapped: VK_WHOLE_SIZE means up to the end of the allocation
+    VkDeviceSize end = 0;               // where the mapping ends, in bytes from the start of the allocation
 };
 
 struct BoundSet {
@@ -844,6 +847,17 @@ std::unordered_map<VkDescriptorSet, std::map<uint32_t, std::vector<DescItem>>> g
 std::unordered_map<VkDescriptorUpdateTemplate, std::vector<TemplateEntry>> g_templates;
 std::unordered_map<VkBuffer, BufferInfo> g_buffers;
 std::unordered_map<VkDeviceMemory, Mapping> g_mapped;
+std::unordered_map<VkDeviceMemory, VkDeviceSize> g_memSize;  // allocation sizes, so a mapping's end is known
+char* RefData(VkBuffer buf, VkDeviceSize off, VkDeviceSize len);
+// vkDeviceWaitIdle needs every queue to itself, but the game submits from several threads, and our
+// QueueSubmit/QueuePresent hooks call the driver outside g_t. So those driver calls hold this shared
+// and WaitIdle holds it exclusively. Never taken together with g_t in the other order: the hooks
+// release it before they take g_t again.
+std::shared_mutex g_queueSync;
+void WaitIdle(DeviceData* d) {
+    std::unique_lock<std::shared_mutex> ql(g_queueSync);
+    d->DeviceWaitIdle(d->device);
+}
 std::unordered_map<VkCommandBuffer, CmdState> g_cmd;  // entries are never erased, so pointers to them stay valid
 
 // The state of a command buffer. A thread records into one command buffer at a time, so it keeps the
@@ -1029,16 +1043,11 @@ float MaxDiff(const float* a, const float* b) {
 }
 
 void LogViewFromMemory(const CmdState& cs) {  // caller holds g_t
-    auto bi = g_buffers.find(cs.viewBuf);
-    if (bi == g_buffers.end()) return;
-    auto mi = g_mapped.find(bi->second.memory);
-    if (mi == g_mapped.end()) {
+    const char* p = RefData(cs.viewBuf, cs.viewOff, kViewSize);
+    if (!p) {
         Log("[view] camera UBO memory is not host-mapped");
         return;
     }
-    VkDeviceSize at = bi->second.memOffset + cs.viewOff;
-    if (at < mi->second.offset) return;
-    const char* p = mi->second.ptr + (at - mi->second.offset);
     float pv[16], pvi[16], proj[16], view[16], tmp[16], ident[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
     std::memcpy(pv, p + ViewOff::projView, 64);
     std::memcpy(pvi, p + ViewOff::projViewInverse, 64);
@@ -1604,7 +1613,7 @@ VkDescriptorSet CachedSetRaw(DeviceData* d, std::vector<std::pair<VkImageView, V
     ai.pSetLayouts = &layout;
     if (d->AllocateDescriptorSets(d->device, &ai, &set) != VK_SUCCESS) {
         if (cache.empty()) return VK_NULL_HANDLE;
-        if (used) d->DeviceWaitIdle(d->device);
+        if (used) WaitIdle(d);
         set = cache.front().second;
         cache.erase(cache.begin());
         Log("[dlss] more than %zu views in rotation; reusing a descriptor set", cache.size() + 1);
@@ -1647,7 +1656,7 @@ VkDescriptorSet CachedSet(DeviceData* d, std::vector<std::pair<VkImageView, VkDe
 // DLSS input colour for the debug view). Called when the game destroys render targets (resolution
 // change): the sets get rebuilt from the new images on the next frame. Caller holds g_t.
 void InvalidateViewCaches(DeviceData* d) {
-    d->DeviceWaitIdle(d->device);  // rare (resize); nothing may still use the sets
+    WaitIdle(d);  // rare (resize); nothing may still use the sets
     if (g_dlss.mvPool) d->ResetDescriptorPool(d->device, g_dlss.mvPool, 0);
     if (g_dlss.objPool) d->ResetDescriptorPool(d->device, g_dlss.objPool, 0);
     if (g_dlss.dbgPool) d->ResetDescriptorPool(d->device, g_dlss.dbgPool, 0);
@@ -1845,7 +1854,7 @@ bool EnsureDebugResources(DeviceData* d, VkImageView colorView) {
     if (g_dlss.dbgBoundMv != g_dlss.mvView || g_dlss.dbgBoundCamBuf != g_dlss.mvBuffer ||
         g_dlss.dbgBoundView != g_dlss.outView) {
         if (!g_dlss.dbgSets.empty()) {
-            if (g_dlss.dbgSetUsed) d->DeviceWaitIdle(d->device);
+            if (g_dlss.dbgSetUsed) WaitIdle(d);
             for (auto& e : g_dlss.dbgSets) e.first = VK_NULL_HANDLE;  // force a rewrite below
         }
         g_dlss.dbgBoundMv = g_dlss.mvView;
@@ -1980,15 +1989,18 @@ bool JitterActive() {
     return g_cfg.jitter && g_dlss.enabled && g_lastDlssFrame != UINT64_MAX && g_lastDlssFrame + 1 >= g_frame;
 }
 
-// Pointer to a camera UBO in mapped memory, or nullptr.
-char* RefData(VkBuffer buf, VkDeviceSize off) {
+// Pointer to `len` bytes at `off` in a buffer's host-mapped memory, or nullptr unless all of them are
+// inside the current mapping (the game may map only part of an allocation, unmap it or free it).
+// Caller holds g_t.
+char* RefData(VkBuffer buf, VkDeviceSize off, VkDeviceSize len) {
     auto bi = g_buffers.find(buf);
     if (bi == g_buffers.end()) return nullptr;
     auto mi = g_mapped.find(bi->second.memory);
     if (mi == g_mapped.end()) return nullptr;
+    const Mapping& mp = mi->second;
     VkDeviceSize at = bi->second.memOffset + off;
-    if (at < mi->second.offset) return nullptr;
-    return mi->second.ptr + (at - mi->second.offset);
+    if (at < mp.offset || at > mp.end || len > mp.end - at) return nullptr;
+    return mp.ptr + (at - mp.offset);
 }
 
 // Copies n bytes out of the game's mapped memory. That memory is usually write-combined (HOST_VISIBLE
@@ -2081,13 +2093,7 @@ bool ReprojectionD(const float* curPV, const float* prevPV, float dx, float dy, 
 // Pointer to this command buffer's camera UBO contents in mapped memory, or nullptr.
 const char* ViewData(const CmdState& cs) {
     if (!cs.hasView) return nullptr;
-    auto bi = g_buffers.find(cs.viewBuf);
-    if (bi == g_buffers.end()) return nullptr;
-    auto mi = g_mapped.find(bi->second.memory);
-    if (mi == g_mapped.end()) return nullptr;
-    VkDeviceSize at = bi->second.memOffset + cs.viewOff;
-    if (at < mi->second.offset) return nullptr;
-    return mi->second.ptr + (at - mi->second.offset);
+    return RefData(cs.viewBuf, cs.viewOff, kViewSize);
 }
 
 void ContourDebugNoteJitter(uint64_t frame, float jx, float jy);
@@ -2369,7 +2375,7 @@ bool EnsureDlssFeature(DeviceData* d, VkCommandBuffer cb) {
         return true;
     if (g_dlss.handle) {
         Log("[dlss] size or preset changed, recreating feature");
-        d->DeviceWaitIdle(d->device);
+        WaitIdle(d);
         NVSDK_NGX_VULKAN_ReleaseFeature(g_dlss.handle);
         g_dlss.handle = nullptr;
     }
@@ -2470,7 +2476,7 @@ bool EnsureSharpen(DeviceData* d) {
         Log("[sharpen] sharpening pass ready");
     }
     if (g_dlss.shpBoundOut != g_dlss.outView) {  // output size changed (rare): new temporary image
-        if (g_dlss.shpSetUsed) d->DeviceWaitIdle(d->device);
+        if (g_dlss.shpSetUsed) WaitIdle(d);
         if (!CreateOwnImage(d, g_dlss.outW, g_dlss.outH, VK_FORMAT_R8G8B8A8_UNORM,
                             VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, &g_dlss.shpImage,
                             &g_dlss.shpView)) {
@@ -2823,7 +2829,7 @@ bool RecordObjectPass(DeviceData* d, VkCommandBuffer cb, CmdState& cs, VkImageVi
     }
     if (g_dlss.objFbView != g_dlss.mvView) {
         if (g_dlss.objFb) {
-            d->DeviceWaitIdle(d->device);
+            WaitIdle(d);
             d->DestroyFramebuffer(d->device, g_dlss.objFb, nullptr);
         }
         VkFramebufferCreateInfo fi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
@@ -2922,11 +2928,11 @@ void ObjFillPrev(CmdState& cs) {
     uint64_t drawn = 0;
     thread_local std::vector<char> copy;  // this draw's instance data, read out of the game's memory at once
     for (const ObjDraw& od : cs.objDraws) {
-        char* src = RefData(od.mdlBuf, od.mdlOff);
-        if (src && od.instances) {
-            size_t span = 0;
-            for (int c = 0; c < 4; ++c) span = std::max(span, (size_t)od.layout.colOffset[c] + 16);
-            span += (size_t)(od.instances - 1) * od.layout.stride;
+        size_t span = 0;
+        for (int c = 0; c < 4; ++c) span = std::max(span, (size_t)od.layout.colOffset[c] + 16);
+        if (od.instances) span += (size_t)(od.instances - 1) * od.layout.stride;
+        char* src = od.instances ? RefData(od.mdlBuf, od.mdlOff, span) : nullptr;  // all of it, or none
+        if (src) {
             copy.resize(span);
             CopyFromMapped(copy.data(), src, span);
             src = copy.data();
@@ -3101,7 +3107,7 @@ bool FsrEnsure(DeviceData* d) {
     if (g_fsr.failed || !FsrLoad()) return false;
     if (g_fsr.ctx) {
         Log("[fsr] size or settings changed, recreating the context");
-        d->DeviceWaitIdle(d->device);
+        WaitIdle(d);
         g_fsr.destroy(&g_fsr.ctx, nullptr);
         g_fsr.ctx = nullptr;
     }
@@ -3208,7 +3214,7 @@ bool RecordFsr(VkCommandBuffer cb, const CmdState& cs, const ImageInfo& ci) {
 
 void DestroyFsr(DeviceData* d) {
     if (g_fsr.ctx) {
-        d->DeviceWaitIdle(d->device);
+        WaitIdle(d);
         g_fsr.destroy(&g_fsr.ctx, nullptr);
         g_fsr.ctx = nullptr;
     }
@@ -3697,7 +3703,7 @@ bool EnsureOverlay(DeviceData* d) {
         Log("[overlay] info box ready");
     }
     if (g_dlss.ovBoundOut != g_dlss.outView) {  // output image recreated (size change)
-        if (g_dlss.ovSetUsed) d->DeviceWaitIdle(d->device);
+        if (g_dlss.ovSetUsed) WaitIdle(d);
         VkDescriptorImageInfo img{VK_NULL_HANDLE, g_dlss.outView, VK_IMAGE_LAYOUT_GENERAL};
         VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, g_dlss.ovSet, 0, 0, 1,
                                VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &img, nullptr, nullptr};
@@ -3831,7 +3837,7 @@ bool EnsureTestUpscale(DeviceData* d) {
         Log("[test] test upscaler ready (TF3_DLSS_TEST_UPSCALER=1)");
     }
     if (g_dlss.tstBoundOut != g_dlss.outView) {  // output image recreated: the sets point at the old one
-        if (g_dlss.tstSetUsed) d->DeviceWaitIdle(d->device);
+        if (g_dlss.tstSetUsed) WaitIdle(d);
         d->ResetDescriptorPool(d->device, g_dlss.tstPool, 0);
         g_dlss.tstSets.clear();
         g_dlss.tstSetUsed = false;
@@ -5153,7 +5159,7 @@ static VKAPI_ATTR void VKAPI_CALL tf3_DestroyDevice(VkDevice device, const VkAll
     {
         TLock lk(g_t);
         if (g_dlss.dev == d) {
-            d->DeviceWaitIdle(device);
+            WaitIdle(d);
             DestroyFsr(d);
             DestroyGpuPerf(d);
             if (g_dlss.handle) NVSDK_NGX_VULKAN_ReleaseFeature(g_dlss.handle);
@@ -5939,6 +5945,37 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_CreateSwapchainKHR(VkDevice device, co
 // =============================================================================================
 // Buffers and mapped memory
 // =============================================================================================
+// The layer reads some of the game's buffers on the CPU (camera, instance data), through the pointers
+// the game mapped. Handles are reused after they are destroyed or freed, so their entries must go with
+// them: else a later buffer or allocation with the same handle would be read through a stale pointer.
+static VKAPI_ATTR VkResult VKAPI_CALL tf3_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo* pInfo,
+                                                         const VkAllocationCallbacks* pAllocator,
+                                                         VkDeviceMemory* pMemory) {
+    VkResult r = GetDevice(Key(device))->AllocateMemory(device, pInfo, pAllocator, pMemory);
+    if (r == VK_SUCCESS) {
+        TLock lk(g_t);
+        g_memSize[*pMemory] = pInfo->allocationSize;
+        g_mapped.erase(*pMemory);
+    }
+    return r;
+}
+static VKAPI_ATTR void VKAPI_CALL tf3_FreeMemory(VkDevice device, VkDeviceMemory memory,
+                                                 const VkAllocationCallbacks* pAllocator) {
+    if (memory) {
+        TLock lk(g_t);
+        g_mapped.erase(memory);  // freeing unmaps it too
+        g_memSize.erase(memory);
+    }
+    GetDevice(Key(device))->FreeMemory(device, memory, pAllocator);
+}
+static VKAPI_ATTR void VKAPI_CALL tf3_DestroyBuffer(VkDevice device, VkBuffer buffer,
+                                                    const VkAllocationCallbacks* pAllocator) {
+    if (buffer) {
+        TLock lk(g_t);
+        g_buffers.erase(buffer);
+    }
+    GetDevice(Key(device))->DestroyBuffer(device, buffer, pAllocator);
+}
 static VKAPI_ATTR VkResult VKAPI_CALL tf3_BindBufferMemory(VkDevice device, VkBuffer buffer, VkDeviceMemory memory,
                                                            VkDeviceSize offset) {
     VkResult r = GetDevice(Key(device))->BindBufferMemory(device, buffer, memory, offset);
@@ -5969,7 +6006,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_MapMemory(VkDevice device, VkDeviceMem
     VkResult r = GetDevice(Key(device))->MapMemory(device, memory, offset, size, flags, ppData);
     if (r == VK_SUCCESS) {
         TLock lk(g_t);
-        g_mapped[memory] = Mapping{static_cast<char*>(*ppData), offset, size};
+        auto ms = g_memSize.find(memory);
+        VkDeviceSize end = size != VK_WHOLE_SIZE ? offset + size : ms != g_memSize.end() ? ms->second : offset;
+        g_mapped[memory] = Mapping{static_cast<char*>(*ppData), offset, size, end};
     }
     return r;
 }
@@ -6454,29 +6493,27 @@ void ProbeCollect(CmdState& cs) {
         g_probeCur.frame = g_frame;
     }
     for (const ObjProbe& p : cs.probes) {
-        char* base = RefData(p.buf, p.base);
+        // read the instances in one go (see CopyFromMapped), as many whole ones as the mapping holds
         auto bi = g_buffers.find(p.buf);
-        if (!base || bi == g_buffers.end()) continue;
-        const Mapping& mp = g_mapped[bi->second.memory];
-        // read the instances in one go (see CopyFromMapped), as far as the mapping goes
-        uint32_t n = std::min(p.count, 4096u);
-        VkDeviceSize from = (VkDeviceSize)p.first * p.stride, to = from + (VkDeviceSize)n * p.stride;
-        if (mp.size != VK_WHOLE_SIZE) {
-            VkDeviceSize mapEnd = mp.offset + mp.size, at = bi->second.memOffset + p.base;
-            to = std::min(to, mapEnd > at ? mapEnd - at : 0);
-        }
+        if (bi == g_buffers.end() || !p.stride) continue;
+        auto mi = g_mapped.find(bi->second.memory);
+        if (mi == g_mapped.end()) continue;
+        const Mapping& mp = mi->second;
+        VkDeviceSize at = bi->second.memOffset + p.base + (VkDeviceSize)p.first * p.stride;  // first instance
+        VkDeviceSize need = (VkDeviceSize)p.colOffset[3] + 12;  // bytes of one instance up to its translation
+        if (at < mp.offset || at > mp.end || mp.end - at < need) continue;
+        uint32_t n = std::min<VkDeviceSize>({p.count, 4096u, (mp.end - at - need) / p.stride + 1});
+        VkDeviceSize span = (VkDeviceSize)(n - 1) * p.stride + need;
+        char* base = RefData(p.buf, p.base + (VkDeviceSize)p.first * p.stride, span);
+        if (!base) continue;
         thread_local std::vector<char> copy;
-        if (to > from) {
-            copy.resize((size_t)(to - from));
-            CopyFromMapped(copy.data(), base + from, copy.size());
-        }
+        copy.resize((size_t)span);
+        CopyFromMapped(copy.data(), base, copy.size());
         for (uint32_t i = 0; i < n; ++i) {
             VkDeviceSize off = (VkDeviceSize)(p.first + i) * p.stride;
             if (!g_probeCur.seen.insert(Mix((uint64_t)(uintptr_t)p.buf, p.base + off)).second) continue;
-            VkDeviceSize end = bi->second.memOffset + p.base + off + p.colOffset[3] + 12;
-            if (mp.size != VK_WHOLE_SIZE && end > mp.offset + mp.size) break;
             float t[3];
-            std::memcpy(t, copy.data() + (off - from) + p.colOffset[3], 12);  // translation = 4th column
+            std::memcpy(t, copy.data() + (size_t)i * p.stride + p.colOffset[3], 12);  // translation = 4th column
             g_probeCur.inst.push_back({p.mesh, t[0], t[1], t[2]});
         }
     }
@@ -6671,7 +6708,12 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_QueueSubmit(VkQueue queue, uint32_t su
     }
     DeviceData* d = GetDevice(Key(queue));
     if (d->checkpoints) NoteQueue(queue);
-    VkResult r = CheckLost(d, d->QueueSubmit(queue, submitCount, pSubmits, fence), "vkQueueSubmit");
+    VkResult r;
+    {
+        std::shared_lock<std::shared_mutex> ql(g_queueSync);
+        r = d->QueueSubmit(queue, submitCount, pSubmits, fence);
+    }
+    CheckLost(d, r, "vkQueueSubmit");
     std::vector<CaptureFrame> toWrite;
     {
         TLock lk(g_t);
@@ -6683,7 +6725,10 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_QueueSubmit(VkQueue queue, uint32_t su
         contourWrite.swap(g_cdbg.pending);
     }
     if ((!toWrite.empty() || !contourWrite.empty()) && r == VK_SUCCESS) {
-        d->QueueWaitIdle(queue);  // recording frames only: wait so the copies are complete
+        {
+            std::shared_lock<std::shared_mutex> ql(g_queueSync);
+            d->QueueWaitIdle(queue);  // recording frames only: wait so the copies are complete
+        }
         TLock lk(g_t);
         for (const auto& f : toWrite) WriteCapture(f);
         for (const auto& f : contourWrite) ContourDebugWrite(f);
@@ -6867,7 +6912,12 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_QueuePresentKHR(VkQueue queue, const V
         PerfPresent();  // perf=1: frame times, and the report every perf_seconds
     }
     DeviceData* d = GetDevice(Key(queue));
-    return CheckLost(d, d->QueuePresentKHR(queue, pInfo), "vkQueuePresentKHR");
+    VkResult r;
+    {
+        std::shared_lock<std::shared_mutex> ql(g_queueSync);
+        r = d->QueuePresentKHR(queue, pInfo);
+    }
+    return CheckLost(d, r, "vkQueuePresentKHR");
 }
 
 // Only to notice a GPU crash (see ReportDeviceLost): the game usually learns of it here first.
