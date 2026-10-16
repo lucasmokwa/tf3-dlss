@@ -1159,6 +1159,11 @@ struct Dlss {
     char* uboPtr = nullptr;
     VkImageView mvDepthView = VK_NULL_HANDLE;  // depth view currently written into mvSet
     bool mvSetUsed = false;
+    // the motion pass's set 1: what the un-jittered depth for the contour lines is made from (the
+    // game's colorMapDepthTex, or the scene depth until a terrain draw was seen), one set per view
+    VkDescriptorSetLayout contourSrcLayout = VK_NULL_HANDLE;
+    VkDescriptorPool contourSrcPool = VK_NULL_HANDLE;
+    std::vector<std::pair<VkImageView, VkDescriptorSet>> contourSrcSets;
     // camera history
     bool havePrev = false;
     float prevPV[16] = {};
@@ -1652,6 +1657,8 @@ void InvalidateViewCaches(DeviceData* d) {
     g_dlss.dbgBoundMv = VK_NULL_HANDLE;  // forces the debug view to rebuild its sets too
     if (g_dlss.tstPool) d->ResetDescriptorPool(d->device, g_dlss.tstPool, 0);
     g_dlss.tstSets.clear();
+    if (g_dlss.contourSrcPool) d->ResetDescriptorPool(d->device, g_dlss.contourSrcPool, 0);
+    g_dlss.contourSrcSets.clear();
     g_dlss.tstSetUsed = false;
 }
 
@@ -1668,9 +1675,21 @@ bool CreateMvResources(DeviceData* d, uint32_t w, uint32_t h) {
         li.bindingCount = 5;
         li.pBindings = b;
         if (d->CreateDescriptorSetLayout(d->device, &li, nullptr, &g_dlss.mvSetLayout) != VK_SUCCESS) return false;
+        VkDescriptorSetLayoutBinding cb0 = {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT,
+                                            nullptr};
+        li.bindingCount = 1;
+        li.pBindings = &cb0;
+        if (d->CreateDescriptorSetLayout(d->device, &li, nullptr, &g_dlss.contourSrcLayout) != VK_SUCCESS) return false;
+        VkDescriptorPoolSize cs = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 16};
+        VkDescriptorPoolCreateInfo cpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        cpi.maxSets = 16;
+        cpi.poolSizeCount = 1;
+        cpi.pPoolSizes = &cs;
+        if (d->CreateDescriptorPool(d->device, &cpi, nullptr, &g_dlss.contourSrcPool) != VK_SUCCESS) return false;
+        VkDescriptorSetLayout setLayouts[2] = {g_dlss.mvSetLayout, g_dlss.contourSrcLayout};
         VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-        pli.setLayoutCount = 1;
-        pli.pSetLayouts = &g_dlss.mvSetLayout;
+        pli.setLayoutCount = 2;
+        pli.pSetLayouts = setLayouts;
         if (d->CreatePipelineLayout(d->device, &pli, nullptr, &g_dlss.mvPipeLayout) != VK_SUCCESS) return false;
         VkShaderModuleCreateInfo si{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         si.codeSize = sizeof kMvSpirv;
@@ -1724,6 +1743,33 @@ bool UpdateMvDepth(DeviceData* d, VkImageView depthView) {
     g_dlss.mvSet = set;
     g_dlss.mvDepthView = depthView;
     return true;
+}
+
+// The motion pass's set 1 for this view (see contourSrcLayout). Sets live until the next
+// InvalidateViewCaches (the game's render targets go away); the views in rotation are few.
+VkDescriptorSet ContourSrcSet(DeviceData* d, VkImageView view) {
+    for (const auto& [v, set] : g_dlss.contourSrcSets)
+        if (v == view) return set;
+    VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    ai.descriptorPool = g_dlss.contourSrcPool;
+    ai.descriptorSetCount = 1;
+    ai.pSetLayouts = &g_dlss.contourSrcLayout;
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    if (d->AllocateDescriptorSets(d->device, &ai, &set) != VK_SUCCESS) {
+        static int warned = 0;
+        if (warned++ < 4) Log("[contour] more than 16 depth views to un-jitter; using the oldest set");
+        if (g_dlss.contourSrcSets.empty()) return VK_NULL_HANDLE;
+        return g_dlss.contourSrcSets.front().second;  // stale but valid: only the contour lines can be off
+    }
+    VkDescriptorImageInfo ii{g_dlss.pointSampler, view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    w.dstSet = set;
+    w.descriptorCount = 1;
+    w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    w.pImageInfo = &ii;
+    d->UpdateDescriptorSets(d->device, 1, &w, 0, nullptr);
+    g_dlss.contourSrcSets.push_back({view, set});
+    return set;
 }
 
 const uint32_t kDbgSpirv[] = {
@@ -2019,6 +2065,7 @@ const char* ViewData(const CmdState& cs) {
 
 void ContourDebugNoteJitter(uint64_t frame, float jx, float jy);
 void ContourDebugCopies(DeviceData* d, VkCommandBuffer cb, CmdState& cs, uint32_t w, uint32_t h);
+VkImageView ContourSourceView(const CmdState& cs, uint32_t w, uint32_t h);
 
 // Called at submit, after the game has written this frame's camera data. Caller holds g_t.
 void UploadMvMatrices(const CmdState& cs) {
@@ -3925,8 +3972,12 @@ void RecordUpscale(DeviceData* d, VkCommandBuffer cb, CmdState& cs) {
         Barrier(d, cb, g_dlss.depth32Image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
         // the un-jittered copy: last frame's terrain draws are done with it (Barrier waits for everything)
         Barrier(d, cb, g_dlss.contourImage, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+        VkImageView contourSrc = ContourSourceView(cs, ci.w, ci.h);
+        VkDescriptorSet srcSet = ContourSrcSet(d, contourSrc ? contourSrc : depthView);
+        if (!srcSet) srcSet = ContourSrcSet(d, depthView);
         d->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_dlss.mvPipeline);
         d->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_dlss.mvPipeLayout, 0, 1, &g_dlss.mvSet, 1, &dyn);
+        d->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_dlss.mvPipeLayout, 1, 1, &srcSet, 0, nullptr);
         d->CmdDispatch(cb, (ci.w + 7) / 8, (ci.h + 7) / 8, 1);
         Barrier(d, cb, g_dlss.depth32Image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, RO);
         Barrier(d, cb, g_dlss.contourImage, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, RO);
@@ -4330,6 +4381,37 @@ void ContourSync(DeviceData* d, VkCommandBuffer cb, CmdState& cs) {
     }
 }
 
+// The game's colorMapDepthTex as the terrain last saw it: the view behind that binding of the game's
+// set we last replaced. It is a copy of the scene depth made mid-frame, before much is drawn over the
+// ground, so it (not the final depth) is what the un-jittered depth has to be made from. Null if
+// unknown or unusable (other size, not readable now). Caller holds g_t.
+VkImage ContourSourceImage(VkImageView* viewOut) {
+    VkDescriptorSet gameSet;
+    uint32_t binding;
+    {
+        std::lock_guard<std::mutex> cl(g_contourLock);
+        gameSet = g_contour.lastGameSet;
+        binding = g_contour.lastBinding;
+    }
+    auto sc = g_setContents.find(gameSet);
+    if (sc == g_setContents.end()) return VK_NULL_HANDLE;
+    auto b = sc->second.find(binding);
+    if (b == sc->second.end() || b->second.empty()) return VK_NULL_HANDLE;
+    VkImage img = ViewImage(b->second[0].view);
+    if (!img || !g_images.count(img)) return VK_NULL_HANDLE;  // destroyed since
+    if (viewOut) *viewOut = b->second[0].view;
+    return img;
+}
+VkImageView ContourSourceView(const CmdState& cs, uint32_t w, uint32_t h) {
+    VkImageView view = VK_NULL_HANDLE;
+    VkImage img = ContourSourceImage(&view);
+    if (!img) return VK_NULL_HANDLE;
+    const ImageInfo& ii = g_images[img];
+    if (ii.w != w || ii.h != h || !IsDepthFormat(ii.fmt)) return VK_NULL_HANDLE;
+    if (CurrentLayout(cs, img) != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) return VK_NULL_HANDLE;
+    return view;
+}
+
 // ---- contour_debug=1 (or Ctrl+Shift+C with debug_keys=1): what the contour lines are drawn from ------
 // Copies, for a few frames in a row right after the motion pass, the game's colorMapDepthTex (as it is at
 // that moment), our un-jittered depth and this frame's jittered depth to disk (contourcap\ next to the
@@ -4349,6 +4431,7 @@ struct ContourDebug {
         VkFormat gameFmt = VK_FORMAT_UNDEFINED;
         std::string gameDesc;  // the game's image, or why it couldn't be copied
         int gameLayout = -1;
+        bool fromGame = false;  // our un-jittered depth was made from the game's copy
     };
     std::vector<Frame> pending;  // copied, written after the GPU finished (at submit)
     int counter = 0;
@@ -4399,20 +4482,9 @@ void ContourDebugCopies(DeviceData* d, VkCommandBuffer cb, CmdState& cs, uint32_
         d->CmdCopyImageToBuffer(cb, img, SRC, g_cdbg.buf[i], 1, &ic);
         Barrier(d, cb, img, VK_IMAGE_ASPECT_COLOR_BIT, SRC, RO);
     }
-    // the game's colorMapDepthTex: the image behind that binding of the set we last replaced
-    VkDescriptorSet gameSet;
-    uint32_t binding;
-    {
-        std::lock_guard<std::mutex> cl(g_contourLock);
-        gameSet = g_contour.lastGameSet;
-        binding = g_contour.lastBinding;
-    }
-    VkImage gimg = VK_NULL_HANDLE;
-    auto sc = g_setContents.find(gameSet);
-    if (sc != g_setContents.end()) {
-        auto b = sc->second.find(binding);
-        if (b != sc->second.end() && !b->second.empty()) gimg = ViewImage(b->second[0].view);
-    }
+    // the game's colorMapDepthTex
+    VkImage gimg = ContourSourceImage(nullptr);
+    f.fromGame = ContourSourceView(cs, w, h) != VK_NULL_HANDLE;
     auto gi = g_images.find(gimg);
     if (!gimg || gi == g_images.end()) {
         f.gameDesc = "not found (no terrain draw seen yet, or its set wasn't tracked)";
@@ -4505,8 +4577,9 @@ void ContourDebugWrite(const ContourDebug::Frame& f) {
           << ",\n  \"jitter_px\": [" << f.jx << ", " << f.jy << "],\n  \"game_copied\": " << (f.gameCopied ? "true" : "false")
           << ",\n  \"game_layout\": " << f.gameLayout << ",\n  \"files\": \"float32, row-major, top row first\"\n}\n";
     }
-    Log("[contour-debug] frame %llu: wrote %s; jitter (%.3f, %.3f) px; game's colorMapDepthTex: %s, layout %d",
-        (unsigned long long)f.frame, base, f.jx, f.jy, f.gameDesc.c_str(), f.gameLayout);
+    Log("[contour-debug] frame %llu: wrote %s; jitter (%.3f, %.3f) px; game's colorMapDepthTex: %s, layout %d; "
+        "ours made from %s", (unsigned long long)f.frame, base, f.jx, f.jy, f.gameDesc.c_str(), f.gameLayout,
+        f.fromGame ? "the game's copy" : "the scene depth");
     if (f.gameCopied) {
         Log("[contour-debug]   game copy vs this frame's jittered depth: %s", DepthDiff(game.data(), depth, n).c_str());
         if (prev)

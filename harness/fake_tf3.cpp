@@ -1113,62 +1113,9 @@ int main(int argc, char** argv) {
             vkCmdSetViewport(cb, 0, 1, &vp);
             vkCmdSetScissor(cb, 0, 1, &sc);
         };
-        // 1. scene, in nThreads parts recorded at the same time: one draw per wall tile, a material bind
-        //    before each (as the game binds per object); the last part also draws the cube
-        auto recordScene = [&](uint32_t part) {
-            VkCommandBuffer cb = cmd[part][slot];
-            VKC(vkBeginCommandBuffer(cb, &bi));
-            if (part == 0 && !contourDepthReady) {  // first frame: no copy yet, so nothing to show either
-                contourDepthReady = true;
-                VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-                b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-                b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-                b.newLayout = RO;
-                b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                b.image = contourDepth.image;
-                b.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, 0, 1, 0, 1};
-                vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0,
-                                     nullptr, 0, nullptr, 1, &b);
-            }
-            begin(cb, part == 0 ? rpScene : rpSceneMore, fbScene, g.render);
-            // as in TF3: set 0 still holds a set of another layout (no colorMapDepthTex) when the terrain
-            // pipeline is bound; its own set follows right after
-            vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, plTex, 0, 1, &tonemapSet, 0, nullptr);
-            vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pScene);
-            vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, plScene, 0, 1, &viewSet[slot], 0, nullptr);
-            VkDeviceSize zero = 0;
-            vkCmdBindVertexBuffers(cb, 0, 1, &quadVb.buf, &zero);
-            vkCmdBindVertexBuffers(cb, 1, 1, &inst[slot].buf, &zero);
-            vkCmdBindIndexBuffer(cb, quadIb.buf, 0, VK_INDEX_TYPE_UINT16);
-            for (uint32_t t = tiles * part / nThreads; t < tiles * (part + 1) / nThreads; ++t) {
-                uint32_t off = (t % (kMaterials - 1)) * kMatStride;
-                vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, plScene, 1, 1, &matSet, 1, &off);
-                vkCmdDrawIndexed(cb, 6, 1, 0, 0, t);
-            }
-            if (part + 1 == nThreads) {
-                uint32_t cubeOff = (kMaterials - 1) * kMatStride;
-                vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, plScene, 1, 1, &matSet, 1, &cubeOff);
-                vkCmdBindVertexBuffers(cb, 0, 1, &cubeVb.buf, &zero);
-                vkCmdBindIndexBuffer(cb, cubeIb.buf, 0, VK_INDEX_TYPE_UINT16);
-                vkCmdDrawIndexed(cb, 36, 2, 0, 0, tiles);  // the moving cube and the parked one
-            }
-            vkCmdEndRenderPass(cb);
-            VKC(vkEndCommandBuffer(cb));
-        };
-        if (nThreads > 1) workers.Run(recordScene);
-        else recordScene(0);
-        // 2-4: the rest of the frame, after the scene (the layer replays the moving objects then)
-        VkCommandBuffer cb = cmd[nThreads][slot];
-        VKC(vkBeginCommandBuffer(cb, &bi));
-        // 2. tonemap (the depth buffer is attached here too, as in TF3)
-        begin(cb, rpTonemap, fbTonemap, g.render);
-        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pTonemap);
-        VkDescriptorSet tonemapSets[] = {viewSet[slot], tonemapSet};
-        vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, plTonemap, 0, 2, tonemapSets, 0, nullptr);
-        vkCmdDraw(cb, 3, 1, 0, 0);
-        vkCmdEndRenderPass(cb);
-        // 2b. the depth copy that next frame's contour lines read (colorMapDepthTex)
-        {
+        // the depth copy that next frame's contour lines read (colorMapDepthTex). As in TF3 it is taken
+        // mid-frame: before the last scene part, so it has the walls but not the cubes.
+        auto copyContourDepth = [&](VkCommandBuffer cb) {
             const VkImageAspectFlags ds = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
             VkImageMemoryBarrier b[2] = {{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER}, {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER}};
             b[0].srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
@@ -1202,7 +1149,63 @@ int main(int argc, char** argv) {
                                  VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
                                      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                  0, 0, nullptr, 0, nullptr, 2, b);
-        }
+        };
+        // 1. scene, in nThreads parts recorded at the same time: one draw per wall tile, a material bind
+        //    before each (as the game binds per object); the last part also draws the cube
+        auto recordScene = [&](uint32_t part) {
+            VkCommandBuffer cb = cmd[part][slot];
+            VKC(vkBeginCommandBuffer(cb, &bi));
+            if (part == 0 && !contourDepthReady) {  // first frame: no copy yet, so nothing to show either
+                contourDepthReady = true;
+                VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+                b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+                b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+                b.newLayout = RO;
+                b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                b.image = contourDepth.image;
+                b.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, 0, 1, 0, 1};
+                vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0,
+                                     nullptr, 0, nullptr, 1, &b);
+            }
+            if (part == nThreads - 1 && part > 0) copyContourDepth(cb);
+            begin(cb, part == 0 ? rpScene : rpSceneMore, fbScene, g.render);
+            // as in TF3: set 0 still holds a set of another layout (no colorMapDepthTex) when the terrain
+            // pipeline is bound; its own set follows right after
+            vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, plTex, 0, 1, &tonemapSet, 0, nullptr);
+            vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pScene);
+            vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, plScene, 0, 1, &viewSet[slot], 0, nullptr);
+            VkDeviceSize zero = 0;
+            vkCmdBindVertexBuffers(cb, 0, 1, &quadVb.buf, &zero);
+            vkCmdBindVertexBuffers(cb, 1, 1, &inst[slot].buf, &zero);
+            vkCmdBindIndexBuffer(cb, quadIb.buf, 0, VK_INDEX_TYPE_UINT16);
+            for (uint32_t t = tiles * part / nThreads; t < tiles * (part + 1) / nThreads; ++t) {
+                uint32_t off = (t % (kMaterials - 1)) * kMatStride;
+                vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, plScene, 1, 1, &matSet, 1, &off);
+                vkCmdDrawIndexed(cb, 6, 1, 0, 0, t);
+            }
+            if (part + 1 == nThreads) {
+                uint32_t cubeOff = (kMaterials - 1) * kMatStride;
+                vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, plScene, 1, 1, &matSet, 1, &cubeOff);
+                vkCmdBindVertexBuffers(cb, 0, 1, &cubeVb.buf, &zero);
+                vkCmdBindIndexBuffer(cb, cubeIb.buf, 0, VK_INDEX_TYPE_UINT16);
+                vkCmdDrawIndexed(cb, 36, 2, 0, 0, tiles);  // the moving cube and the parked one
+            }
+            vkCmdEndRenderPass(cb);
+            if (nThreads == 1) copyContourDepth(cb);  // one part only: after it
+            VKC(vkEndCommandBuffer(cb));
+        };
+        if (nThreads > 1) workers.Run(recordScene);
+        else recordScene(0);
+        // 2-4: the rest of the frame, after the scene (the layer replays the moving objects then)
+        VkCommandBuffer cb = cmd[nThreads][slot];
+        VKC(vkBeginCommandBuffer(cb, &bi));
+        // 2. tonemap (the depth buffer is attached here too, as in TF3)
+        begin(cb, rpTonemap, fbTonemap, g.render);
+        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pTonemap);
+        VkDescriptorSet tonemapSets[] = {viewSet[slot], tonemapSet};
+        vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, plTonemap, 0, 2, tonemapSets, 0, nullptr);
+        vkCmdDraw(cb, 3, 1, 0, 0);
+        vkCmdEndRenderPass(cb);
         // 3. FSR 1 EASU and RCAS stand-ins (magenta)
         begin(cb, rpPost, fbEasu, g.out);
         vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pEasu);
@@ -1329,10 +1332,12 @@ int main(int argc, char** argv) {
                          : "the log never says the colorMapDepthTex draws got the un-jittered depth");
         if (log.find("contour_debug=1") != std::string::npos) {  // the run with contour_debug=1
             bool dbg = log.find("game copy vs our un-jittered depth") != std::string::npos &&
+                       log.find("ours made from the game's copy") != std::string::npos &&
                        fs::exists(g_opt.out / "contourcap", ec);
             AddCheck("contour debug capture", dbg,
-                     dbg ? "contour_debug=1 saved the game's colorMapDepthTex and ours, and logged how far apart they are"
-                         : "contour_debug=1 didn't save or compare the game's colorMapDepthTex");
+                     dbg ? "contour_debug=1 saved the game's colorMapDepthTex and ours (made from it), and compared them"
+                         : "contour_debug=1 didn't save or compare the game's colorMapDepthTex, or ours wasn't "
+                           "made from it");
         }
         std::vector<fs::path> caps;
         for (auto& e : fs::directory_iterator(g_opt.out / "mvcap", ec))

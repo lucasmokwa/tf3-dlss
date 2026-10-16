@@ -39,6 +39,9 @@ layout(set = 0, binding = 2, std140) uniform Matrices {
 } u;
 layout(set = 0, binding = 3, r32f) writeonly uniform image2D depthOut;
 layout(set = 0, binding = 4, r32f) writeonly uniform image2D unjitteredDepthOut;
+// What unjitteredDepthOut is made from: the game's own depth copy for the contour lines
+// (colorMapDepthTex, copied mid-frame before much of the scene is drawn over the ground), else depthTex.
+layout(set = 1, binding = 0) uniform sampler2D contourSrcTex;
 
 // Depth at pixel p as if rendered without jitter: the viewport was shifted by +jitter pixels, so the
 // un-jittered pixel centre p + 0.5 shows what the jittered image has at p + 0.5 + jitter. Bilinear
@@ -49,13 +52,13 @@ float UnjitteredDepth(ivec2 p, ivec2 size, vec2 jitter) {
     ivec2 i0 = ivec2(floor(at));
     vec2 f = at - vec2(i0);
     ivec2 hi = size - 1;
-    float d00 = texelFetch(depthTex, clamp(i0, ivec2(0), hi), 0).r;
-    float d10 = texelFetch(depthTex, clamp(i0 + ivec2(1, 0), ivec2(0), hi), 0).r;
-    float d01 = texelFetch(depthTex, clamp(i0 + ivec2(0, 1), ivec2(0), hi), 0).r;
-    float d11 = texelFetch(depthTex, clamp(i0 + ivec2(1, 1), ivec2(0), hi), 0).r;
+    float d00 = texelFetch(contourSrcTex, clamp(i0, ivec2(0), hi), 0).r;
+    float d10 = texelFetch(contourSrcTex, clamp(i0 + ivec2(1, 0), ivec2(0), hi), 0).r;
+    float d01 = texelFetch(contourSrcTex, clamp(i0 + ivec2(0, 1), ivec2(0), hi), 0).r;
+    float d11 = texelFetch(contourSrcTex, clamp(i0 + ivec2(1, 1), ivec2(0), hi), 0).r;
     if (max(max(d00, d10), max(d01, d11)) >= 1.0) {
         ivec2 n = clamp(ivec2(floor(at + 0.5)), ivec2(0), hi);
-        return texelFetch(depthTex, n, 0).r;
+        return texelFetch(contourSrcTex, n, 0).r;
     }
     return mix(mix(d00, d10, f.x), mix(d01, d11, f.x), f.y);
 }
@@ -67,7 +70,7 @@ void main() {
     float d = texelFetch(depthTex, p, 0).r;
     imageStore(depthOut, p, vec4(d));
     if (u.sizeAndScale.z == 0.0) {  // no camera data this frame: jitter unknown too
-        imageStore(unjitteredDepthOut, p, vec4(d));
+        imageStore(unjitteredDepthOut, p, vec4(texelFetch(contourSrcTex, p, 0).r));
         mvOut[p.y * size.x + p.x] = 0u;
         return;
     }
