@@ -271,11 +271,11 @@ struct Config {
     float mvScaleY = 1.f;
     float resetDistance = 1000; // camera jump (world units per frame) that resets DLSS history
     int mvDouble = 1;           // camera motion: 1 = one reprojection matrix built in double, 0 = float (old)
-    int jitter = 1;             // sub-pixel camera jitter (needed for DLSS to resolve detail)
+    int jitter = 0;             // sub-pixel camera jitter (DLSS needs it to resolve detail); off by default for now (crash/corruption reports)
     int jitterPhases = 0;       // 0 = NVIDIA's recommendation for the current scale
     int jitterScreenPasses = 0; // debug: 1 = also jitter full-screen passes (reflections, AO, bloom), as before 0.2
     int jitterOtherTargets = 1; // jitter 3D draws into every render-size target, not just the main 3D pass
-    int objectMotion = 1;       // motion vectors for moving objects (vehicles), not just the camera
+    int objectMotion = 0;       // motion vectors for moving objects (vehicles), not just the camera; off by default for now (crash/corruption reports)
     int objectDepthTest = 1;    // debug: 0 = draw object motion even where the object is hidden
     int fixHighlightDepth = 1;  // keep the hover highlight's overlay from writing depth (needs a restart)
     bool mipBiasAuto = true;    // texture LOD bias: log2(render/display), -1 at 50% (needs a restart)

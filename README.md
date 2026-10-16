@@ -39,6 +39,9 @@ written to the registry or outside the game folder, and no other program sees th
 
 ## Known limitations
 
+- Jitter and object motion (`jitter`, `object_motion` in the cfg) are off by default for now, while possible
+  crashes and graphics corruption with them on are looked into. Without them the image is a little softer and
+  moving vehicles can leave faint trails; set either to 1 to turn it back on.
 - People and animals (skinned models) get camera motion only.
 - Smoke, clouds and other effects without depth get no motion vectors and can trail.
 - Vulkan renderer only (TF3's only renderer).

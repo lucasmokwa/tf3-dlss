@@ -69,15 +69,15 @@ function Run([string]$name, [string]$cfg, [string]$withLayers, [string[]]$opts) 
 
 $vopt = @()
 if ($Validation) { $vopt = @('--validation') }
-# object_motion=1: the default, set here so the checks cover the object pass whatever the default
-Run 'checks' "log_every=100`nobject_motion=1" $layers $vopt
+# jitter=1 and object_motion=1 (both off by default for now): the checks cover the jittered path and the object pass
+Run 'checks' "log_every=100`njitter=1`nobject_motion=1" $layers $vopt
 # The cost runs are longer, with a [perf] report every 2 s: a GPU does 300 frames in about a second.
 $cost = @('--frames', "$CostFrames")
-Run 'perf' "perf=1`nperf_seconds=2`nobject_motion=1" 'VK_LAYER_TF3_dlss' $cost
+Run 'perf' "perf=1`nperf_seconds=2`njitter=1`nobject_motion=1" 'VK_LAYER_TF3_dlss' $cost
 Run 'no_layer' '' '' @('--no-checks')
 Remove-Item Env:TF3_DLSS_CAPTURE -ErrorAction SilentlyContinue   # no recordings in the cost runs
-Run 'city_off' "perf=1`nperf_seconds=2`nobject_motion=0" 'VK_LAYER_TF3_dlss' ($cost + @('--vehicles', "$Vehicles", '--no-checks'))
-Run 'city_on' "perf=1`nperf_seconds=2`nobject_motion=1" 'VK_LAYER_TF3_dlss' ($cost + @('--vehicles', "$Vehicles", '--no-checks'))
+Run 'city_off' "perf=1`nperf_seconds=2`njitter=1`nobject_motion=0" 'VK_LAYER_TF3_dlss' ($cost + @('--vehicles', "$Vehicles", '--no-checks'))
+Run 'city_on' "perf=1`nperf_seconds=2`njitter=1`nobject_motion=1" 'VK_LAYER_TF3_dlss' ($cost + @('--vehicles', "$Vehicles", '--no-checks'))
 Write-Host ''
 Write-Host 'CPU time per frame for recording, with and without the layer:'
 Select-String -Path (Join-Path $out 'perf\fake_tf3.txt'), (Join-Path $out 'no_layer\fake_tf3.txt') -Pattern 'CPU time per frame' | ForEach-Object { $_.Line }
