@@ -54,13 +54,14 @@ run() {  # name, extra cfg lines, layers, fake_tf3 options...
 vopt=""
 [ -n "$validation" ] && vopt="--validation"
 with_val="VK_LAYER_TF3_dlss${validation:+:$validation}"
-# object_motion=1 in checks, skip_fsr and perf: the default, set here so the checks cover the object pass whatever the default
-run checks "log_every=100\nobject_motion=1" "$with_val" $vopt
-run skip_fsr "skip_game_fsr=1\nobject_motion=1\ncontour_debug=1" "$with_val" $vopt
-run perf "perf=1\nperf_seconds=5\nobject_motion=1" "VK_LAYER_TF3_dlss"
+# jitter=1 and object_motion=1 everywhere (both off by default for now): the checks cover the jittered path and the
+# object pass, and the cost runs stay comparable with older builds
+run checks "log_every=100\njitter=1\nobject_motion=1" "$with_val" $vopt
+run skip_fsr "skip_game_fsr=1\njitter=1\nobject_motion=1\ncontour_debug=1" "$with_val" $vopt
+run perf "perf=1\nperf_seconds=5\njitter=1\nobject_motion=1" "VK_LAYER_TF3_dlss"
 run no_layer "" "" --no-checks
-CAP= run city_off "perf=1\nperf_seconds=5\nobject_motion=0" "VK_LAYER_TF3_dlss" --vehicles 2400 --no-checks
-CAP= run city_on "perf=1\nperf_seconds=5\nobject_motion=1" "VK_LAYER_TF3_dlss" --vehicles 2400 --no-checks
+CAP= run city_off "perf=1\nperf_seconds=5\njitter=1\nobject_motion=0" "VK_LAYER_TF3_dlss" --vehicles 2400 --no-checks
+CAP= run city_on "perf=1\nperf_seconds=5\njitter=1\nobject_motion=1" "VK_LAYER_TF3_dlss" --vehicles 2400 --no-checks
 echo
 echo "CPU time per frame for recording, with and without the layer:"
 grep -h 'CPU time per frame' "$out/perf/fake_tf3.txt" "$out/no_layer/fake_tf3.txt"

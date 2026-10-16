@@ -146,7 +146,7 @@ if m["calls"]:
 if m["object_motion_cost"]:
     veh = (result("city_on") or {}).get("vehicles", "?")
     md += ["### What object motion costs", "",
-           f"Busy city: {veh} vehicles in 48 models, 1 in 20 moving, with `object_motion=0` and `=1` (the default).", "",
+           f"Busy city: {veh} vehicles in 48 models, 1 in 20 moving, with `object_motion=0` (the default) and `=1`.", "",
            "| per frame | object_motion=0 | object_motion=1 | **cost** |" + (" cost on main | change |" if base else ""),
            "|---|---|---|---|" + ("---|---|" if base else "")]
     was = (base or {}).get("object_motion_cost", {})

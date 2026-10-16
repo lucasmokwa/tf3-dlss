@@ -70,6 +70,9 @@ IF SOMETHING IS WRONG
 - Smearing or ghosting behind moving things: people and animals currently get
   camera motion only, and smoke/clouds have no depth, so some trails there
   are expected. Anything else: please report it.
+- Faint trails behind vehicles, or a slightly soft image: jitter and
+  object_motion are off by default for now (possible crashes and graphics
+  corruption with them on). You can turn them on in tf3_dlss.cfg.
 - To rule the mod out completely, uninstall it (or set the environment
   variable TF3_DLSS_DISABLE=1).
 
