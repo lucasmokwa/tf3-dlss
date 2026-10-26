@@ -22,13 +22,15 @@ if (-not (Test-Path $proxy)) { throw 'build\proxy\version.dll is missing (build.
 
 # The shipped cfg must have the developer options off.
 $cfg = Get-Content (Join-Path $root 'tf3_dlss.cfg') -Raw
-foreach ($pair in 'debug_keys=0', 'debug_view=0', 'dlss_dev=0', 'fsr_debug=0', 'overlay=0', 'perf=0', 'enabled=1', 'upscaler=auto') {
+foreach ($pair in 'debug_keys=0', 'debug_view=0', 'dlss_dev=0', 'fsr_debug=0', 'overlay=0', 'perf=0', 'enabled=1', 'upscaler=auto', 'fsr_version=auto') {
     if ($cfg -notmatch "(?m)^$([regex]::Escape($pair))\s*$") { throw "tf3_dlss.cfg should have $pair for a release" }
 }
 
 if (Test-Path $rel) { Remove-Item $rel -Recurse -Force }
 New-Item -ItemType Directory -Force (Join-Path $out 'bin'), (Join-Path $out 'licenses') | Out-Null
 foreach ($f in $need) { Copy-Item (Join-Path $bin $f) (Join-Path $out 'bin') }
+# AMD's Vulkan FSR 4 runtime (loader + upscaler), once it exists and has been put in build\bin.
+Get-ChildItem $bin -Filter 'amd_fidelityfx_*_vk.dll' | ForEach-Object { Copy-Item $_.FullName (Join-Path $out 'bin') }
 Copy-Item $proxy $rel
 Copy-Item (Join-Path $pkg 'licenses\*') (Join-Path $out 'licenses')
 Copy-Item (Join-Path $pkg 'README.txt') $out
