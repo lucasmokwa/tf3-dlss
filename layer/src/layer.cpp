@@ -76,6 +76,10 @@
 #define TF3_EXPORT extern "C" __declspec(dllexport)
 #else
 #define TF3_EXPORT extern "C" __attribute__((visibility("default")))
+#include <fcntl.h>  // crash_log trail file
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 #endif
 
 #define LAYER_NAME "VK_LAYER_TF3_dlss"
@@ -206,6 +210,210 @@ std::string H(T handle) {
 }
 
 // ---------------------------------------------------------------------------------------------
+// crash_log=1: the layer's last steps on disk, and a report when the game crashes
+// ---------------------------------------------------------------------------------------------
+// Players' crashes can't be reproduced here, and the log only has what is logged every log_every
+// frames. With crash_log=1 the layer notes each step that matters for a crash (submits, presents,
+// the upscaler, size changes, render targets the game destroys, waits for the GPU, which draws get
+// the upscaled image) in tf3_dlss_trail.txt: a ring of the last kTrailLines lines in a memory-mapped
+// file, so it is on disk even when the process dies without a word. The first column numbers the
+// lines: the highest is the last step. The previous run's trail is kept as tf3_dlss_trail.previous.txt.
+// On Windows a crash in any module (access violation and the like) also writes tf3_dlss_crash.txt
+// (exception, module + offset, the stack, the trail in order) and a small minidump, tf3_dlss_crash.dmp.
+constexpr uint32_t kTrailLines = 512, kTrailLineLen = 160;
+std::atomic<bool> g_trailOn{false};
+std::atomic<uint64_t> g_trailNext{0};
+std::atomic<uint64_t> g_trailFrame{0};  // the frame being recorded (set at present)
+char* g_trail = nullptr;                // kTrailLines * kTrailLineLen bytes, mapped from the file
+std::chrono::steady_clock::time_point g_trailStart;
+std::filesystem::path g_crashDir;
+
+uint32_t ThreadId() {
+#ifdef _WIN32
+    return (uint32_t)GetCurrentThreadId();
+#else
+    return (uint32_t)syscall(SYS_gettid);
+#endif
+}
+
+// One line in the trail. Costs a relaxed load when crash_log=0; about a microsecond when on.
+void Crumb(const char* fmt, ...) {
+    if (!g_trailOn.load(std::memory_order_relaxed)) return;
+    uint64_t n = g_trailNext.fetch_add(1, std::memory_order_relaxed);
+    char* line = g_trail + (n % kTrailLines) * kTrailLineLen;
+    long long ms = (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
+                       std::chrono::steady_clock::now() - g_trailStart).count();
+    int k = std::snprintf(line, kTrailLineLen, "%7llu %9lldms f%-8llu t%-6u ", (unsigned long long)n, ms,
+                          (unsigned long long)g_trailFrame.load(std::memory_order_relaxed), ThreadId());
+    if (k < 0 || k >= (int)kTrailLineLen - 1) k = 0;
+    va_list ap;
+    va_start(ap, fmt);
+    int m = std::vsnprintf(line + k, kTrailLineLen - k, fmt, ap);
+    va_end(ap);
+    size_t used = std::min<size_t>((size_t)k + (m > 0 ? (size_t)m : 0), kTrailLineLen - 1);
+    std::memset(line + used, ' ', kTrailLineLen - 1 - used);  // fixed-width lines: no leftovers of older ones
+    line[kTrailLineLen - 1] = '\n';
+}
+
+// The trail's lines from the oldest to the newest.
+void WriteTrail(FILE* f) {
+    uint64_t end = g_trailNext.load(), begin = end > kTrailLines ? end - kTrailLines : 0;
+    for (uint64_t n = begin; n < end; ++n) std::fwrite(g_trail + (n % kTrailLines) * kTrailLineLen, 1, kTrailLineLen, f);
+}
+
+#ifdef _WIN32
+typedef BOOL(WINAPI* PFN_MiniDumpWriteDump)(HANDLE, DWORD, HANDLE, int, const void*, const void*, const void*);
+PFN_MiniDumpWriteDump g_miniDump = nullptr;
+
+// "nvoglv64.dll+0x1a2b3c" for a code address.
+void ModuleOffset(DWORD64 addr, char* out, size_t len) {
+    HMODULE mod = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            reinterpret_cast<LPCWSTR>(addr), &mod) || !mod) {
+        std::snprintf(out, len, "0x%llx (no module)", (unsigned long long)addr);
+        return;
+    }
+    wchar_t wpath[MAX_PATH] = {};
+    GetModuleFileNameW(mod, wpath, MAX_PATH);
+    const wchar_t* base = wcsrchr(wpath, L'\\');
+    base = base ? base + 1 : wpath;
+    char name[MAX_PATH] = {};
+    WideCharToMultiByte(CP_UTF8, 0, base, -1, name, (int)sizeof name, nullptr, nullptr);
+    std::snprintf(out, len, "%s+0x%llx", name, (unsigned long long)(addr - (DWORD64)mod));
+}
+
+// Every exception goes past here first (a vectored handler), also those the game or the driver
+// handle themselves, so only crash-type codes are reported, at most 3, and the game goes on as if
+// the layer wasn't here (EXCEPTION_CONTINUE_SEARCH).
+LONG CALLBACK CrashHandler(EXCEPTION_POINTERS* ep) {
+    DWORD code = ep->ExceptionRecord->ExceptionCode;
+    switch (code) {
+        case EXCEPTION_ACCESS_VIOLATION: case EXCEPTION_ILLEGAL_INSTRUCTION: case EXCEPTION_PRIV_INSTRUCTION:
+        case EXCEPTION_IN_PAGE_ERROR: case EXCEPTION_STACK_OVERFLOW: case EXCEPTION_INT_DIVIDE_BY_ZERO:
+        case 0xC0000374:  // heap corruption
+            break;
+        default: return EXCEPTION_CONTINUE_SEARCH;
+    }
+    static std::atomic<int> reports{0};
+    int nr = reports.fetch_add(1);
+    if (nr >= 3) return EXCEPTION_CONTINUE_SEARCH;
+    Crumb("CRASH: exception 0x%08lx", (unsigned long)code);
+    static char where[MAX_PATH + 32];  // static: little stack is left after a stack overflow
+    ModuleOffset((DWORD64)ep->ExceptionRecord->ExceptionAddress, where, sizeof where);
+    FILE* f = OpenFile((g_crashDir / "tf3_dlss_crash.txt").wstring(), nr == 0 ? L"w" : L"a");
+    if (f) {
+        SYSTEMTIME t;
+        GetLocalTime(&t);
+        std::fprintf(f, "TF3-DLSS %s: exception 0x%08lx at %s, thread %u, frame %llu, %04u-%02u-%02u %02u:%02u:%02u\n",
+                     TF3_DLSS_VERSION, (unsigned long)code, where, ThreadId(),
+                     (unsigned long long)g_trailFrame.load(), t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+        if (code == EXCEPTION_ACCESS_VIOLATION && ep->ExceptionRecord->NumberParameters >= 2) {
+            ULONG_PTR op = ep->ExceptionRecord->ExceptionInformation[0];
+            std::fprintf(f, "%s address 0x%llx\n", op == 0 ? "read of" : op == 1 ? "write to" : "execute at",
+                         (unsigned long long)ep->ExceptionRecord->ExceptionInformation[1]);
+        }
+        std::fprintf(f, "(reported when it happened: if the game kept running, it was handled and isn't the crash)\n");
+#if defined(_M_X64)
+        std::fprintf(f, "stack:\n");
+        CONTEXT ctx = *ep->ContextRecord;
+        for (int i = 0; i < 32 && ctx.Rip; ++i) {
+            ModuleOffset(ctx.Rip, where, sizeof where);
+            std::fprintf(f, "  %2d %s\n", i, where);
+            DWORD64 imageBase = 0;
+            PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(ctx.Rip, &imageBase, nullptr);
+            if (!fn) {  // leaf function: the return address is on top of the stack
+                ctx.Rip = *reinterpret_cast<DWORD64*>(ctx.Rsp);
+                ctx.Rsp += 8;
+                continue;
+            }
+            void* handlerData = nullptr;
+            DWORD64 establisher = 0;
+            RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, ctx.Rip, fn, &ctx, &handlerData, &establisher, nullptr);
+        }
+#endif
+        std::fprintf(f, "the layer's last steps (tf3_dlss_trail.txt), oldest first:\n");
+        WriteTrail(f);
+        std::fclose(f);
+    }
+    if (nr == 0 && g_miniDump) {
+        HANDLE h = CreateFileW((g_crashDir / "tf3_dlss_crash.dmp").wstring().c_str(), GENERIC_WRITE, 0, nullptr,
+                               CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h != INVALID_HANDLE_VALUE) {
+            struct {  // MINIDUMP_EXCEPTION_INFORMATION (dbghelp.h isn't included for this one call)
+                DWORD ThreadId;
+                EXCEPTION_POINTERS* ExceptionPointers;
+                BOOL ClientPointers;
+            } mei = {GetCurrentThreadId(), ep, FALSE};
+            const int type = 0x1000 | 0x2000;  // MiniDumpWithThreadInfo | MiniDumpWithUnloadedModules
+            g_miniDump(GetCurrentProcess(), GetCurrentProcessId(), h, type, &mei, nullptr, nullptr);
+            CloseHandle(h);
+        }
+    }
+    if (g_logLock.try_lock()) {  // not if the crashing thread was logging
+        if (g_log) {
+            std::fprintf(g_log, "[crash] exception 0x%08lx at %s (frame %llu); see tf3_dlss_crash.txt\n",
+                         (unsigned long)code, where, (unsigned long long)g_trailFrame.load());
+            std::fflush(g_log);
+        }
+        g_logLock.unlock();
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+#endif
+
+// Map the trail file and (Windows) install the crash handler. Once on, the handler stays; crash_log=0
+// while playing only stops the trail.
+void CrashLogStart() {
+    static bool started = false;
+    if (started) {
+        if (g_trail) g_trailOn = true;
+        return;
+    }
+    started = true;
+    g_crashDir = g_logPath.empty() ? std::filesystem::path(RootDir()) : std::filesystem::path(g_logPath).parent_path();
+    std::filesystem::path trail = g_crashDir / "tf3_dlss_trail.txt", prev = g_crashDir / "tf3_dlss_trail.previous.txt";
+    std::error_code ec;
+    std::filesystem::remove(prev, ec);
+    std::filesystem::rename(trail, prev, ec);
+    const size_t size = (size_t)kTrailLines * kTrailLineLen;
+#ifdef _WIN32
+    HANDLE file = CreateFileW(trail.wstring().c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+                              CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    HANDLE map = file == INVALID_HANDLE_VALUE ? nullptr
+                                              : CreateFileMappingW(file, nullptr, PAGE_READWRITE, 0, (DWORD)size, nullptr);
+    if (map) g_trail = static_cast<char*>(MapViewOfFile(map, FILE_MAP_WRITE, 0, 0, size));
+    // the handles stay open for the life of the process: the view keeps the file on disk up to date
+    if (HMODULE dbghelp = LoadLibraryW(L"dbghelp.dll"))  // loaded now, not inside the handler
+        g_miniDump = reinterpret_cast<PFN_MiniDumpWriteDump>(GetProcAddress(dbghelp, "MiniDumpWriteDump"));
+    AddVectoredExceptionHandler(1, CrashHandler);
+#else
+    int fd = open(trail.string().c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
+    if (fd >= 0 && ftruncate(fd, (off_t)size) == 0) {
+        void* p = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (p != MAP_FAILED) g_trail = static_cast<char*>(p);
+    }
+#endif
+    if (!g_trail) {
+        Log("[crash] couldn't create %s; no trail", trail.string().c_str());
+        return;
+    }
+    for (uint32_t i = 0; i < kTrailLines; ++i) {
+        std::memset(g_trail + i * kTrailLineLen, ' ', kTrailLineLen - 1);
+        g_trail[i * kTrailLineLen + kTrailLineLen - 1] = '\n';
+    }
+    g_trailStart = std::chrono::steady_clock::now();
+    g_trailOn = true;
+    Log("[crash] crash_log=1: the last steps go to %s%s", trail.string().c_str(),
+#ifdef _WIN32
+        "; a crash writes tf3_dlss_crash.txt and tf3_dlss_crash.dmp next to it"
+#else
+        ""
+#endif
+    );
+    Crumb("trail started (TF3-DLSS %s)", TF3_DLSS_VERSION);
+}
+
+// ---------------------------------------------------------------------------------------------
 // TF3-DLSS-DID-NOT-START.txt: written into the mod folder when the game loads the layer, kept up
 // to date with the reason the upscaler isn't running, and deleted once an upscaled frame has been
 // shown. If the game is closed (or crashes) before that, the file tells the player what happened.
@@ -299,6 +507,7 @@ struct Config {
     int gpuCrashInfo = 0;       // GPU checkpoints + fault report in the log if the GPU crashes (off by default; needs a restart)
     int contourFix = 1;         // give the terrain contour lines an un-jittered depth (see ContourSync)
     int contourDebug = 0;       // 1 = save the game's contour depth next to ours (see ContourDebugCopies)
+    int crashLog = 0;           // 1 = trail of the layer's last steps + crash report (see CrashLogStart); off by default
 } g_cfg;
 
 std::filesystem::path g_cfgPath;
@@ -390,18 +599,21 @@ bool LoadConfig() {
         else if (k == "gpu_crash_info") c.gpuCrashInfo = iv;
         else if (k == "contour_fix") c.contourFix = iv;
         else if (k == "contour_debug") c.contourDebug = iv;
+        else if (k == "crash_log") c.crashLog = iv;
         else Log("[cfg] unknown setting '%s' ignored", k.c_str());
     }
     g_cfg = c;
     Log("[cfg] loaded %s: enabled=%d upscaler=%s preset=%d motion_vectors=%d object_motion=%d jitter=%d (phases %d, "
         "sign %g,%g, fsr sign %g,%g) sharpness=%g fsr_sharpness=%g mip_bias=%s%g fsr_color=%s fsr_debug=%d overlay=%d debug_keys=%d "
         "dlss_dev=%d mv_scale=(%g,%g) reset_distance=%g mv_double=%d debug_view=%d cfg_live=%d log_every=%d perf=%d "
-        "perf_seconds=%g skip_game_fsr=%d gpu_crash_info=%d contour_fix=%d contour_debug=%d",
+        "perf_seconds=%g skip_game_fsr=%d gpu_crash_info=%d contour_fix=%d contour_debug=%d crash_log=%d",
         g_cfgPath.string().c_str(), c.enabled, PrefName(c.upscaler), c.preset, c.motionVectors, c.objectMotion,
         c.jitter, c.jitterPhases, c.jitterSignX, c.jitterSignY, c.fsrJitterSignX, c.fsrJitterSignY, c.sharpness, c.fsrSharpness,
         c.mipBiasAuto ? "auto " : "", c.mipBias, c.fsrColorSrgb ? "srgb" : "linear", c.fsrDebug, c.overlay,
         c.debugKeys, c.dlssDev, c.mvScaleX, c.mvScaleY, c.resetDistance, c.mvDouble, c.debugView, c.cfgLive, c.logEvery,
-        c.perf, c.perfSeconds, c.skipGameFsr, c.gpuCrashInfo, c.contourFix, c.contourDebug);
+        c.perf, c.perfSeconds, c.skipGameFsr, c.gpuCrashInfo, c.contourFix, c.contourDebug, c.crashLog);
+    if (c.crashLog) CrashLogStart();
+    else g_trailOn = false;
     return true;
 }
 
@@ -855,8 +1067,10 @@ char* RefData(VkBuffer buf, VkDeviceSize off, VkDeviceSize len);
 // release it before they take g_t again.
 std::shared_mutex g_queueSync;
 void WaitIdle(DeviceData* d) {
+    Crumb("wait for GPU idle");
     std::unique_lock<std::shared_mutex> ql(g_queueSync);
-    d->DeviceWaitIdle(d->device);
+    VkResult r = d->DeviceWaitIdle(d->device);
+    Crumb("GPU idle (%d)", (int)r);
 }
 std::unordered_map<VkCommandBuffer, CmdState> g_cmd;  // entries are never erased, so pointers to them stay valid
 
@@ -2323,6 +2537,7 @@ bool EnsureImages(DeviceData* d, uint32_t inW, uint32_t inH, uint32_t outW, uint
     if (g_dlss.imagesFailed) return false;  // don't retry (and leak) every frame
     if (!g_dlss.outImage || g_dlss.outW != outW || g_dlss.outH != outH) {
         if (g_dlss.outImage) Log("[upscale] output size changed to %ux%u", outW, outH);
+        Crumb("output image %ux%u -> %ux%u", g_dlss.outW, g_dlss.outH, outW, outH);
         if (!CreateOwnImage(d, outW, outH, VK_FORMAT_R8G8B8A8_UNORM,
                             VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                                 VK_IMAGE_USAGE_TRANSFER_SRC_BIT,  // copied out by recordings
@@ -2340,6 +2555,7 @@ bool EnsureImages(DeviceData* d, uint32_t inW, uint32_t inH, uint32_t outW, uint
     }
     if (!g_dlss.mvImage || g_dlss.inW != inW || g_dlss.inH != inH) {
         if (g_dlss.mvImage) Log("[upscale] render size changed to %ux%u", inW, inH);
+        Crumb("render-size images %ux%u -> %ux%u", g_dlss.inW, g_dlss.inH, inW, inH);
         if (!CreateOwnImage(d, inW, inH, VK_FORMAT_R16G16_SFLOAT,
                             VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                                 VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,  // recordings
@@ -2375,6 +2591,7 @@ bool EnsureDlssFeature(DeviceData* d, VkCommandBuffer cb) {
         return true;
     if (g_dlss.handle) {
         Log("[dlss] size or preset changed, recreating feature");
+        Crumb("DLSS feature: release");
         WaitIdle(d);
         NVSDK_NGX_VULKAN_ReleaseFeature(g_dlss.handle);
         g_dlss.handle = nullptr;
@@ -2395,7 +2612,9 @@ bool EnsureDlssFeature(DeviceData* d, VkCommandBuffer cb) {
     cp.Feature.InTargetHeight = g_dlss.outH;
     cp.Feature.InPerfQualityValue = NVSDK_NGX_PerfQuality_Value_MaxQuality;
     cp.InFeatureCreateFlags = NVSDK_NGX_DLSS_Feature_Flags_MVLowRes;  // LDR input, MVs at render res
+    Crumb("DLSS feature: create %ux%u -> %ux%u preset %d", g_dlss.inW, g_dlss.inH, g_dlss.outW, g_dlss.outH, g_cfg.preset);
     NVSDK_NGX_Result r = NGX_VULKAN_CREATE_DLSS_EXT1(d->device, cb, 1, 1, &g_dlss.handle, g_dlss.params, &cp);
+    Crumb("DLSS feature: created (0x%08x)", (unsigned)r);
     if (NVSDK_NGX_FAILED(r)) {
         Log("[dlss] CreateFeature failed: 0x%08x", (unsigned)r);
         char b[96];
@@ -3105,6 +3324,7 @@ bool FsrEnsure(DeviceData* d) {
         g_fsr.outH == g_dlss.outH && g_fsr.debugInUse == dbg && g_fsr.srgbInUse == g_cfg.fsrColorSrgb)
         return true;
     if (g_fsr.failed || !FsrLoad()) return false;
+    Crumb("FSR context: (re)create %ux%u -> %ux%u", g_dlss.inW, g_dlss.inH, g_dlss.outW, g_dlss.outH);
     if (g_fsr.ctx) {
         Log("[fsr] size or settings changed, recreating the context");
         WaitIdle(d);
@@ -3442,7 +3662,10 @@ void ReportDeviceLost(DeviceData* d, const char* where) {
 }
 
 VkResult CheckLost(DeviceData* d, VkResult r, const char* where) {
-    if (r == VK_ERROR_DEVICE_LOST) ReportDeviceLost(d, where);
+    if (r == VK_ERROR_DEVICE_LOST) {
+        Crumb("DEVICE LOST (%s)", where);
+        ReportDeviceLost(d, where);
+    }
     return r;
 }
 
@@ -3978,6 +4201,8 @@ void RecordUpscale(DeviceData* d, VkCommandBuffer cb, CmdState& cs) {
                          (unsigned long long)g_frame, (int)colorLayout, (int)depthLayout);
         return;
     }
+    Crumb("upscale: cb %p color %p %ux%u depth %p %ux%u -> %ux%u", (void*)cb, (void*)cs.colorImage, ci.w, ci.h,
+          (void*)cs.depthImage, di.w, di.h, g_swapExtent.width, g_swapExtent.height);
     if (!EnsureImages(d, ci.w, ci.h, g_swapExtent.width, g_swapExtent.height)) return;
     if (backend == Backend::Dlss && !EnsureDlssFeature(d, cb)) return;  // auto mode moves on to FSR next frame
     if (backend == Backend::Fsr && (!g_dlss.mvReady || !FsrEnsure(d))) {
@@ -4112,6 +4337,7 @@ void RecordUpscale(DeviceData* d, VkCommandBuffer cb, CmdState& cs) {
         ok = RecordTestUpscale(d, cb, cs);
     }
     GpuMark(d, cb, kGmUpscaler);
+    Crumb("upscale: %s recorded, ok %d", BackendName(backend), (int)ok);
 
     if (g_cap.outPending && g_cap.out && ok) {  // recording: the upscaler's output itself
         Barrier(d, cb, g_dlss.outImage, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL,
@@ -4224,6 +4450,7 @@ VkDescriptorSet BlitSet(DeviceData* d, VkDescriptorSet gameSet, uint32_t binding
     w.pImageInfo = &ii;
     d->UpdateDescriptorSets(d->device, 1, &w, (uint32_t)copies.size(), copies.data());
     g_dlss.blitSets[layout] = ours;
+    Crumb("blit: new replacement set %p for layout %p (from game set %p)", (void*)ours, (void*)layout, (void*)gameSet);
     Log("[blit] created replacement set %s for layout %s (binding %u type %d; layout:%s)", H(ours).c_str(),
         H(layout).c_str(), binding, (int)type, layoutDesc.c_str());
     return ours;
@@ -4711,6 +4938,16 @@ SwapPlan OnDraw(DeviceData* d, CmdState& cs) {
     plan.set = ours;
     plan.index = (uint32_t)si;
     plan.layout = cs.sets[si].layout;
+    {   // the trail: which draws get the upscaled image (normally one pipeline; a menu may add others)
+        static VkPipeline lastPipe = VK_NULL_HANDLE;
+        static VkPipelineLayout lastLayout = VK_NULL_HANDLE;
+        if (cs.pipeline != lastPipe || plan.layout != lastLayout) {
+            lastPipe = cs.pipeline;
+            lastLayout = plan.layout;
+            Crumb("blit swap: pipeline %p set %d binding %d game set %p ours %p (%zu dynamic offsets bound)",
+                  (void*)cs.pipeline, si, binding, (void*)cs.sets[si].set, (void*)ours, cs.sets[si].dynOffsets.size());
+        }
+    }
     g_lastSwapFrame = g_frame;
     return plan;
 }
@@ -5816,6 +6053,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_CreateImage(VkDevice device, const VkI
         if (IsDepthFormat(info.format) && info.extent.width >= 1000 && info.extent.width != info.extent.height)
             g_sceneRenderW = info.extent.width;  // the game's render width (for the texture LOD bias)
         g_images[*pImage] = ImageInfo{info.extent.width, info.extent.height, info.format, info.usage};
+        if (info.extent.width >= 1000 && (info.usage & 0x30))
+            Crumb("game creates render target %p %ux%u format %d", (void*)*pImage, info.extent.width,
+                  info.extent.height, (int)info.format);
         g_layout[*pImage] = info.initialLayout;
         if (info.extent.width >= 1800 && info.arrayLayers == 1 && (info.usage & 0x30))  // render targets only
             Log("[image] %s%s", ImageDesc(*pImage).c_str(), addedSampled ? "  (+SAMPLED)" : "");
@@ -5832,6 +6072,7 @@ static VKAPI_ATTR void VKAPI_CALL tf3_DestroyImage(VkDevice device, VkImage imag
         TLock lk(g_t);
         auto ii = g_images.find(image);
         bool renderTarget = ii != g_images.end() && ii->second.w >= 1000 && ii->second.w != ii->second.h;
+        if (renderTarget) Crumb("game destroys render target %p %ux%u", (void*)image, ii->second.w, ii->second.h);
         auto dv = g_dlss.depthViews.find(image);
         if (dv != g_dlss.depthViews.end() || (renderTarget && !g_dlss.mvSets.empty())) {
             static int logged = 0;
@@ -5937,6 +6178,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_CreateSwapchainKHR(VkDevice device, co
     if (r == VK_SUCCESS) {
         TLock lk(g_t);
         g_swapExtent = pInfo->imageExtent;
+        Crumb("swapchain %p %ux%u", (void*)*pSwapchain, pInfo->imageExtent.width, pInfo->imageExtent.height);
         Log("[swapchain] %ux%u format %d", pInfo->imageExtent.width, pInfo->imageExtent.height, (int)pInfo->imageFormat);
     }
     return r;
@@ -6710,9 +6952,12 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_QueueSubmit(VkQueue queue, uint32_t su
     if (d->checkpoints) NoteQueue(queue);
     VkResult r;
     {
+        Crumb("submit: queue %p, %u batches, first cb %p", (void*)queue, submitCount,
+              submitCount && pSubmits[0].commandBufferCount ? (void*)pSubmits[0].pCommandBuffers[0] : nullptr);
         std::shared_lock<std::shared_mutex> ql(g_queueSync);
         r = d->QueueSubmit(queue, submitCount, pSubmits, fence);
     }
+    Crumb("submit done (%d)", (int)r);
     CheckLost(d, r, "vkQueueSubmit");
     std::vector<CaptureFrame> toWrite;
     {
@@ -6905,6 +7150,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_QueuePresentKHR(VkQueue queue, const V
                 g_lastDlssFrame == g_frame ? "ran" : "did not run", g_lastSwapFrame == g_frame ? "yes" : "no");
         }
         ++g_frame;
+        g_trailFrame.store(g_frame, std::memory_order_relaxed);
         UpdateHot();
     }
     {
@@ -6914,9 +7160,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_QueuePresentKHR(VkQueue queue, const V
     DeviceData* d = GetDevice(Key(queue));
     VkResult r;
     {
+        Crumb("present: queue %p", (void*)queue);
         std::shared_lock<std::shared_mutex> ql(g_queueSync);
         r = d->QueuePresentKHR(queue, pInfo);
     }
+    Crumb("present done (%d)", (int)r);
     return CheckLost(d, r, "vkQueuePresentKHR");
 }
 

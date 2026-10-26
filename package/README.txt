@@ -67,6 +67,10 @@ IF SOMETHING IS WRONG
   TF3-DLSS folder are directly next to TransportFever3.exe.
 - tf3_dlss.log in this folder (or %TEMP%) has the details. Please attach it
   to any bug report, with your GPU and the render scale you use.
+- The game crashes? Set crash_log=1 in tf3_dlss.cfg, make it crash once more,
+  then attach tf3_dlss.log, tf3_dlss_trail.txt, tf3_dlss_crash.txt and
+  tf3_dlss_crash.dmp from this folder to your report (the last two exist only
+  if the crash was caught). Start the game again only after copying them.
 - Smearing or ghosting behind moving things: people and animals currently get
   camera motion only, and smoke/clouds have no depth, so some trails there
   are expected. Anything else: please report it.

@@ -121,6 +121,14 @@ finished, from markers between the mod's passes and at the start of the game's c
 the driver's description of the fault where it gives one. That tells a crash in the mod's passes
 from one in the game's own work.
 
+For crashes that happen on players' PCs, `crash_log=1` (off by default, applies live) keeps the layer's
+last 512 steps (submits, presents, the upscaler, size changes, render targets the game destroys or
+creates, waits for the GPU, which pipelines get the upscaled image) in `tf3_dlss_trail.txt`, a
+memory-mapped file that is on disk even if the process dies without a word; the previous run's is
+kept as `tf3_dlss_trail.previous.txt`. On Windows a crash in any module also writes
+`tf3_dlss_crash.txt` (exception, module + offset, the stack, the trail oldest first) and a small
+minidump, `tf3_dlss_crash.dmp`. Combine it with `gpu_crash_info=1` for "Device lost" crashes.
+
 ## Testing without the game
 
 `harness/fake_tf3` is a small Vulkan program that renders frames shaped like TF3's (3D scene with
