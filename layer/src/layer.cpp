@@ -265,7 +265,7 @@ struct Config {
     int fsrDebug = 0;           // FSR: 1 = input checks (messages in the log), 2 = also FSR's debug view
     float fsrJitterSignX = 1.f; // FSR's jitter sign, like jitter_sign_x/y for DLSS
     float fsrJitterSignY = 1.f;
-    int fsrVersion = 0;         // FSR version: 0 = auto (AMD's runtime picks the best for the GPU), 3 or 4 = ask for that one
+    int fsrVersion = 0;         // experimental. FSR version: 0 = auto (AMD's runtime picks the best for the GPU), 3 or 4 = ask for that one
     int debugKeys = 0;          // developer hotkeys (tests, draw log, motion/jitter toggles, debug view)
     int motionVectors = 1;      // 1 = camera motion vectors, 0 = zero motion (milestone 3 behaviour)
     float mvScaleX = 1.f;       // debug: multiply motion vectors (use -1 to flip an axis)
