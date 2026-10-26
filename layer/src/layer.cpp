@@ -265,6 +265,7 @@ struct Config {
     int fsrDebug = 0;           // FSR: 1 = input checks (messages in the log), 2 = also FSR's debug view
     float fsrJitterSignX = 1.f; // FSR's jitter sign, like jitter_sign_x/y for DLSS
     float fsrJitterSignY = 1.f;
+    int fsrVersion = 0;         // FSR version: 0 = auto (AMD's runtime picks the best for the GPU), 3 or 4 = ask for that one
     int debugKeys = 0;          // developer hotkeys (tests, draw log, motion/jitter toggles, debug view)
     int motionVectors = 1;      // 1 = camera motion vectors, 0 = zero motion (milestone 3 behaviour)
     float mvScaleX = 1.f;       // debug: multiply motion vectors (use -1 to flip an axis)
@@ -350,6 +351,14 @@ bool LoadConfig() {
             c.fsrColorSrgb = lv != "linear";
         }
         else if (k == "fsr_debug") c.fsrDebug = iv;
+        else if (k == "fsr_version") {
+            std::string lv = v;
+            for (auto& ch : lv) ch = (char)std::tolower((unsigned char)ch);
+            if (lv == "auto" || lv == "0") c.fsrVersion = 0;
+            else if (lv == "3" || lv == "3.1") c.fsrVersion = 3;
+            else if (lv == "4" || lv == "4.1") c.fsrVersion = 4;
+            else Log("[cfg] fsr_version=%s not understood (auto, 3 or 4); using auto", v.c_str());
+        }
         else if (k == "fsr_jitter_sign_x") c.fsrJitterSignX = fv;
         else if (k == "fsr_jitter_sign_y") c.fsrJitterSignY = fv;
         else if (k == "debug_keys") c.debugKeys = iv;
@@ -394,12 +403,12 @@ bool LoadConfig() {
     }
     g_cfg = c;
     Log("[cfg] loaded %s: enabled=%d upscaler=%s preset=%d motion_vectors=%d object_motion=%d jitter=%d (phases %d, "
-        "sign %g,%g, fsr sign %g,%g) sharpness=%g fsr_sharpness=%g mip_bias=%s%g fsr_color=%s fsr_debug=%d overlay=%d debug_keys=%d "
+        "sign %g,%g, fsr sign %g,%g) sharpness=%g fsr_sharpness=%g mip_bias=%s%g fsr_color=%s fsr_debug=%d fsr_version=%d overlay=%d debug_keys=%d "
         "dlss_dev=%d mv_scale=(%g,%g) reset_distance=%g mv_double=%d debug_view=%d cfg_live=%d log_every=%d perf=%d "
         "perf_seconds=%g skip_game_fsr=%d gpu_crash_info=%d contour_fix=%d contour_debug=%d",
         g_cfgPath.string().c_str(), c.enabled, PrefName(c.upscaler), c.preset, c.motionVectors, c.objectMotion,
         c.jitter, c.jitterPhases, c.jitterSignX, c.jitterSignY, c.fsrJitterSignX, c.fsrJitterSignY, c.sharpness, c.fsrSharpness,
-        c.mipBiasAuto ? "auto " : "", c.mipBias, c.fsrColorSrgb ? "srgb" : "linear", c.fsrDebug, c.overlay,
+        c.mipBiasAuto ? "auto " : "", c.mipBias, c.fsrColorSrgb ? "srgb" : "linear", c.fsrDebug, c.fsrVersion, c.overlay,
         c.debugKeys, c.dlssDev, c.mvScaleX, c.mvScaleY, c.resetDistance, c.mvDouble, c.debugView, c.cfgLive, c.logEvery,
         c.perf, c.perfSeconds, c.skipGameFsr, c.gpuCrashInfo, c.contourFix, c.contourDebug);
     return true;
@@ -1108,8 +1117,9 @@ std::pair<int, int> FindSampled(const CmdState& cs, VkImage img) {
 // DLSS state
 // =============================================================================================
 enum class Backend { None, Dlss, Fsr, Test };
+char g_fsrLabel[32] = "FSR 3.1";  // "FSR " + the version AMD's runtime reports, once its context exists
 const char* BackendName(Backend b) {
-    return b == Backend::Dlss ? "DLSS" : b == Backend::Fsr ? "FSR 3.1" : b == Backend::Test ? "test upscaler" : "none";
+    return b == Backend::Dlss ? "DLSS" : b == Backend::Fsr ? g_fsrLabel : b == Backend::Test ? "test upscaler" : "none";
 }
 // TF3_DLSS_TEST_UPSCALER=1 (the test harness): a bilinear resize (test_upscale.comp) replaces DLSS and
 // FSR 3.1, so everything around the upscaler can be tested on any GPU. Not a cfg setting on purpose.
@@ -2991,7 +3001,10 @@ void ObjFillPrev(CmdState& cs) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// FSR 3.1 (AMD FidelityFX API, amd_fidelityfx_vk.dll next to the layer)
+// FSR 3.1 / 4 (AMD FidelityFX API, next to the layer). amd_fidelityfx_vk.dll (FidelityFX SDK v1.1.4) is
+// FSR 3.1. AMD's FSR 4 for Vulkan isn't published yet; its DX12 SDK ships amd_fidelityfx_loader_dx12.dll,
+// so a Vulkan amd_fidelityfx_loader_vk.dll in the bin folder is tried first. The runtime lists the
+// versions it can run on this GPU (logged); fsr_version picks one, auto lets the runtime decide.
 // ---------------------------------------------------------------------------------------------
 struct Fsr {
 #ifdef _WIN32
@@ -3020,14 +3033,25 @@ void FfxMessage(uint32_t type, const wchar_t* msg) {
     Log("[fsr] %s: %s", type == FFX_API_MESSAGE_TYPE_ERROR ? "error" : "warning", Narrow(m).c_str());
 }
 
-// Load amd_fidelityfx_vk.dll once. Caller holds g_t.
+// Load the FidelityFX runtime once. Caller holds g_t.
 bool FsrLoad() {
     if (!g_fsr.deviceReady) return false;  // g_fsr.why says why
     if (g_fsr.loadTried) return g_fsr.available;
     g_fsr.loadTried = true;
 #ifdef _WIN32
-    std::wstring path = ModuleDir() + L"\\amd_fidelityfx_vk.dll";
-    g_fsr.lib = LoadLibraryExW(path.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+    std::wstring path;
+    if (g_cfg.fsrVersion != 3) {  // fsr_version=3 sticks to the FSR 3.1 runtime
+        path = ModuleDir() + L"\\amd_fidelityfx_loader_vk.dll";
+        if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            g_fsr.lib = LoadLibraryExW(path.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+            if (!g_fsr.lib)
+                Log("[fsr] couldn't load %s (error %lu), trying FSR 3.1", Narrow(path).c_str(), (unsigned long)GetLastError());
+        }
+    }
+    if (!g_fsr.lib) {
+        path = ModuleDir() + L"\\amd_fidelityfx_vk.dll";
+        g_fsr.lib = LoadLibraryExW(path.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+    }
     if (!g_fsr.lib) {
         g_fsr.why = "amd_fidelityfx_vk.dll is missing from the mod's bin folder";
         Log("[fsr] couldn't load %s (error %lu)", Narrow(path).c_str(), (unsigned long)GetLastError());
@@ -3038,7 +3062,7 @@ bool FsrLoad() {
     g_fsr.dispatch = (PfnFfxDispatch)(void*)GetProcAddress(g_fsr.lib, "ffxDispatch");
     g_fsr.query = (PfnFfxQuery)(void*)GetProcAddress(g_fsr.lib, "ffxQuery");
     if (!g_fsr.create || !g_fsr.destroy || !g_fsr.dispatch || !g_fsr.query) {
-        g_fsr.why = "amd_fidelityfx_vk.dll is not a FidelityFX API runtime (wrong file?)";
+        g_fsr.why = Narrow(path.substr(path.find_last_of(L'\\') + 1)) + " is not a FidelityFX API runtime (wrong file?)";
         Log("[fsr] %s", g_fsr.why.c_str());
         return false;
     }
@@ -3098,6 +3122,39 @@ VkPhysicalDevice AppPhysicalDevice(DeviceData* d) {
     return VK_NULL_HANDLE;
 }
 
+// Log the upscaler versions the runtime offers on this GPU and return the id for fsr_version
+// (0 = let the runtime choose: auto, or the asked-for version isn't offered). Caller holds g_t.
+uint64_t FsrPickVersion(DeviceData* d) {
+    uint64_t n = 0;
+    ffxQueryDescGetVersions q{};
+    q.header.type = FFX_API_QUERY_DESC_TYPE_GET_VERSIONS;
+    q.createDescType = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
+    q.device = (void*)d->device;
+    q.outputCount = &n;
+    if (g_fsr.query(nullptr, &q.header) != FFX_API_RETURN_OK || !n) {
+        Log("[fsr] the runtime didn't list its versions; using its default");
+        return 0;
+    }
+    std::vector<uint64_t> ids(n);
+    std::vector<const char*> names(n, nullptr);
+    q.versionIds = ids.data();
+    q.versionNames = names.data();
+    if (g_fsr.query(nullptr, &q.header) != FFX_API_RETURN_OK) return 0;
+    std::string list;
+    uint64_t pick = 0;
+    for (uint64_t i = 0; i < n; ++i) {
+        const char* nm = names[i] ? names[i] : "?";
+        list += (i ? ", " : "") + std::string(nm);
+        const char* digit = std::strpbrk(nm, "0123456789");  // names look like "3.1.4" or "FSR 4.1.1"
+        int major = digit ? std::atoi(digit) : 0;
+        if (!pick && g_cfg.fsrVersion && (major == g_cfg.fsrVersion || (g_cfg.fsrVersion == 4 && major > 4))) pick = ids[i];
+    }
+    Log("[fsr] versions offered on this GPU: %s", list.c_str());
+    if (g_cfg.fsrVersion && !pick)
+        Log("[fsr] fsr_version=%d isn't offered on this GPU or by this runtime; using the runtime's default", g_cfg.fsrVersion);
+    return pick;
+}
+
 // (Re)create the FSR context for the current sizes. Caller holds g_t.
 bool FsrEnsure(DeviceData* d) {
     int dbg = g_cfg.fsrDebug ? 1 : 0;
@@ -3113,7 +3170,7 @@ bool FsrEnsure(DeviceData* d) {
     }
     VkPhysicalDevice appPd = AppPhysicalDevice(d);
     if (!appPd) {
-        g_fsr.why = "FSR 3.1 could not find the GPU through the Vulkan loader";
+        g_fsr.why = "FSR could not find the GPU through the Vulkan loader";
         g_fsr.failed = true;
         Log("[fsr] %s", g_fsr.why.c_str());
         return false;
@@ -3133,11 +3190,17 @@ bool FsrEnsure(DeviceData* d) {
     cd.maxRenderSize = {g_dlss.inW, g_dlss.inH};
     cd.maxUpscaleSize = {g_dlss.outW, g_dlss.outH};
     cd.fpMessage = &FfxMessage;
+    ffxOverrideVersion ov{};
+    ov.header.type = FFX_API_DESC_TYPE_OVERRIDE_VERSION;
+    if (uint64_t id = FsrPickVersion(d)) {
+        ov.versionId = id;
+        be.header.pNext = &ov.header;
+    }
     Log("[fsr] creating the context (%ux%u -> %ux%u)", g_dlss.inW, g_dlss.inH, g_dlss.outW, g_dlss.outH);
     ffxReturnCode_t r = g_fsr.create(&g_fsr.ctx, &cd.header, nullptr);
     if (r != FFX_API_RETURN_OK || !g_fsr.ctx) {
         char b[96];
-        std::snprintf(b, sizeof b, "FSR 3.1 could not be started (FidelityFX error %u)", (unsigned)r);
+        std::snprintf(b, sizeof b, "FSR could not be started (FidelityFX error %u)", (unsigned)r);
         g_fsr.why = b;
         g_fsr.failed = true;
         g_fsr.ctx = nullptr;
@@ -3154,6 +3217,11 @@ bool FsrEnsure(DeviceData* d) {
     ffxQueryGetProviderVersion pv{};
     pv.header.type = FFX_API_QUERY_DESC_TYPE_GET_PROVIDER_VERSION;
     const char* ver = g_fsr.query(&g_fsr.ctx, &pv.header) == FFX_API_RETURN_OK && pv.versionName ? pv.versionName : "?";
+    if (pv.versionName) {  // "3.1.4" -> "FSR 3.1", "4.1.1" -> "FSR 4.1" (names that already say FSR are kept)
+        const char* digit = std::strpbrk(ver, "0123456789");
+        int maj = 0, min = 0;
+        if (digit && std::sscanf(digit, "%d.%d", &maj, &min) == 2) std::snprintf(g_fsrLabel, sizeof g_fsrLabel, "FSR %d.%d", maj, min);
+    }
     Log("[fsr] context created: %ux%u -> %ux%u, FSR version %s, colour %s%s", g_dlss.inW, g_dlss.inH, g_dlss.outW,
         g_dlss.outH, ver, g_cfg.fsrColorSrgb ? "sRGB" : "linear", dbg ? ", debug checking on" : "");
     return true;
@@ -3717,7 +3785,7 @@ bool EnsureOverlay(DeviceData* d) {
 std::vector<std::string> OverlayLines(Backend backend, const CmdState& cs, uint32_t inW, uint32_t inH) {
     char b[kOvLines][96];
     bool fsr = backend == Backend::Fsr;
-    if (fsr) std::snprintf(b[0], sizeof b[0], "TF3-DLSS " TF3_DLSS_VERSION "  FSR 3.1");
+    if (fsr) std::snprintf(b[0], sizeof b[0], "TF3-DLSS " TF3_DLSS_VERSION "  %s", g_fsrLabel);
     else if (g_cfg.preset > 0)
         std::snprintf(b[0], sizeof b[0], "TF3-DLSS " TF3_DLSS_VERSION "  DLSS, PRESET %c", 'A' + g_cfg.preset - 1);
     else std::snprintf(b[0], sizeof b[0], "TF3-DLSS " TF3_DLSS_VERSION "  DLSS, PRESET AUTO");
